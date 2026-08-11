@@ -4,7 +4,7 @@ const nextConfig: NextConfig = {
   experimental: {
     serverActions: { bodySizeLimit: "25mb" }
   },
-  serverExternalPackages: ["pdfjs-dist", "adm-zip"]
+  serverExternalPackages: ["pdfjs-dist", "adm-zip", "sharp", "@napi-rs/canvas"]
 };
 
 export default nextConfig;

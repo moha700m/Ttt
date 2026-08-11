@@ -17,5 +17,17 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
   const file = order.files.find((entry) => entry.version === kind);
   if (!file) return jsonError("الملف غير جاهز", 404);
   const bytes = await readPrivateFile(id, file.storageKey);
-  return new NextResponse(new Uint8Array(bytes), { headers: { "content-type": file.mimeType, "content-disposition": `${kind === "translated_preview" ? "inline" : "attachment"}; filename="${encodeURIComponent(file.filename)}"`, "cache-control": "private, no-store" } });
+  const isPreview = kind === "translated_preview";
+  const previewExtension = file.filename.split(".").pop() || "pdf";
+  return new NextResponse(new Uint8Array(bytes), {
+    headers: {
+      "content-type": file.mimeType,
+      "content-disposition": `${isPreview ? "inline" : "attachment"}; filename="${encodeURIComponent(isPreview ? `preview-${order.orderNumber}.${previewExtension}` : file.filename)}"`,
+      "cache-control": "private, no-store, max-age=0",
+      "x-content-type-options": "nosniff",
+      "x-robots-tag": "noindex, nofollow, noarchive",
+      "referrer-policy": "no-referrer",
+      ...(isPreview ? { "content-security-policy": "frame-ancestors 'self'" } : {})
+    }
+  });
 }

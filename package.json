@@ -14,6 +14,7 @@
     "test:e2e": "tsx tests/e2e-smoke.ts"
   },
   "dependencies": {
+    "@napi-rs/canvas": "0.1.100",
     "@fontsource/noto-sans-arabic": "5.2.5",
     "@pdf-lib/fontkit": "1.1.1",
     "@supabase/supabase-js": "2.57.0",
@@ -23,6 +24,7 @@
     "pdfjs-dist": "5.4.149",
     "react": "19.1.5",
     "react-dom": "19.1.5",
+    "sharp": "0.34.5",
     "zod": "4.1.5"
   },
   "devDependencies": {
