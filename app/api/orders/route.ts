@@ -45,7 +45,8 @@ export async function POST(request: Request) {
     await addAudit("order_created", "customer", id, { filename: file.name, pages: quote.pages });
     return NextResponse.json({ order: publicOrder(order), customerToken });
   } catch (error) {
-    const message = error instanceof z.ZodError ? "تحقق من بيانات الطلب" : error instanceof Error ? error.message : "تعذر إنشاء الطلب";
+    console.error("order_create_failed", error);
+    const message = error instanceof z.ZodError ? "تحقق من بيانات الطلب" : error instanceof Error && /SUPABASE_ORDER|SUPABASE_STORAGE|ENOENT|EACCES|EROFS/.test(error.message) ? "تعذر حفظ الملف حاليًا. أعد المحاولة بعد لحظات." : "تعذر إنشاء الطلب";
     return NextResponse.json({ error: message }, { status: 400 });
   }
 }

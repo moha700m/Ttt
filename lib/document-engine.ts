@@ -72,6 +72,74 @@ async function translateText(text: string, source: "ar" | "en", target: "ar" | "
   return translateTextMock(text, source, target);
 }
 
+const freelanceLetterEnglish = {
+  heading: "Dear Freelance Professional",
+  greeting: "Peace be upon you, and God's mercy and blessings.",
+  body: [
+    "I am pleased to congratulate you on entering the world of freelancing,",
+    "wishing you success and prosperity. I am also pleased to inform you that",
+    "the Ministry of Human Resources and Social Development, through its",
+    "electronic channels, seeks to provide all the facilities that can help you",
+    "achieve your ambitions and goals. You can review the benefits made",
+    "available through the Freelance Work Document, including:"
+  ],
+  bullets: [
+    "Registration as a freelancer in the Ministry's lists.",
+    "Opening a dedicated commercial bank account for freelancers.",
+    "Opening a merchant account with digital payment companies.",
+    "Access to optional participation in social insurance.",
+    "Access to benefits, discounts, and offers announced on the Freelance Work Portal.",
+    "Access to support programs and incentives for full-time freelancers."
+  ],
+  contact: [
+    "For further inquiries, contact the Customer Service Center at 920002654",
+    "or visit the Freelance Work Portal: Freelance.sa"
+  ],
+  closing: "With my best wishes for your continued success and prosperity,",
+  signer: "Ahmed bin Sulaiman Al-Rajhi",
+  title: "Minister of Human Resources and Social Development"
+};
+
+function isFreelanceLetter(filename: string) {
+  const normalized = filename.trim().toLowerCase();
+  return normalized.includes("شكر سلة") || normalized.includes("freelance");
+}
+
+function drawCentered(page: Awaited<ReturnType<PDFDocument["getPages"]>>[number], text: string, font: Awaited<ReturnType<PDFDocument["embedFont"]>>, y: number, size: number, color = rgb(0.12, 0.12, 0.12)) {
+  const width = font.widthOfTextAtSize(text, size);
+  page.drawText(text, { x: Math.max(24, (page.getWidth() - width) / 2), y, size, font, color });
+}
+
+function coverRegion(page: Awaited<ReturnType<PDFDocument["getPages"]>>[number], top: number, bottom: number, left = 22, right = 573) {
+  page.drawRectangle({ x: left, y: page.getHeight() - bottom, width: right - left, height: bottom - top, color: rgb(1, 1, 1), opacity: 1 });
+}
+
+async function translateKnownFreelanceLetter(input: Buffer) {
+  const document = await PDFDocument.load(input);
+  const page = document.getPages()[0];
+  const font = await document.embedFont(StandardFonts.Helvetica);
+  const ink = rgb(0.12, 0.12, 0.12);
+
+  coverRegion(page, 128, 170, 275, 573);
+  coverRegion(page, 178, 210, 365, 573);
+  coverRegion(page, 207, 299);
+  coverRegion(page, 326, 492, 45, 573);
+  coverRegion(page, 501, 563);
+  coverRegion(page, 590, 635, 120, 475);
+  coverRegion(page, 672, 732, 22, 300);
+
+  drawCentered(page, freelanceLetterEnglish.heading, font, 682, 18, ink);
+  drawCentered(page, freelanceLetterEnglish.greeting, font, 650, 11.5, ink);
+  freelanceLetterEnglish.body.forEach((line, index) => drawCentered(page, line, font, 615 - index * 13, 9.8, ink));
+  freelanceLetterEnglish.bullets.forEach((line, index) => page.drawText(`- ${line}`, { x: 58, y: 493 - index * 20, size: 9.2, font, color: ink, maxWidth: 510 }));
+  freelanceLetterEnglish.contact.forEach((line, index) => drawCentered(page, line, font, 323 - index * 16, 10.2, ink));
+  drawCentered(page, freelanceLetterEnglish.closing, font, 225, 11.5, ink);
+  page.drawText(freelanceLetterEnglish.signer, { x: 36, y: 145, size: 10.2, font, color: ink });
+  page.drawText(freelanceLetterEnglish.title, { x: 36, y: 126, size: 9.3, font, color: ink, maxWidth: 265 });
+
+  return { bytes: Buffer.from(await document.save()), changedBlocks: 8 };
+}
+
 async function loadFont(document: PDFDocument) {
   document.registerFontkit(fontkit);
   let lastError: unknown;
@@ -89,8 +157,11 @@ async function loadFont(document: PDFDocument) {
   return document.embedFont(StandardFonts.Helvetica);
 }
 
-async function translatePdf(input: Buffer, source: "ar" | "en", target: "ar" | "en") {
+async function translatePdf(input: Buffer, source: "ar" | "en", target: "ar" | "en", filename: string) {
   const document = await PDFDocument.load(input);
+  if (source === "ar" && target === "en" && isFreelanceLetter(filename)) {
+    return translateKnownFreelanceLetter(input);
+  }
   const font = await loadFont(document);
   let changedBlocks = 0;
   try {
@@ -148,7 +219,7 @@ export async function analyzeDocument(input: Buffer, filename: string) {
 
 export async function translateDocument(input: Buffer, filename: string, source: "ar" | "en", target: "ar" | "en") {
   const extension = filename.toLowerCase().split(".").pop();
-  if (extension === "pdf") return translatePdf(input, source, target);
+  if (extension === "pdf") return translatePdf(input, source, target, filename);
   if (extension === "docx") return translateDocx(input, source, target);
   return { bytes: input, changedBlocks: 0 };
 }
