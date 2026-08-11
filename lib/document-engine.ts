@@ -306,6 +306,29 @@ interface PdfTextLine {
   fragments: PdfTextFragment[];
 }
 
+type PdfJsModule = typeof import("pdfjs-dist/legacy/build/pdf.mjs");
+
+let pdfJsModulePromise: Promise<PdfJsModule> | undefined;
+
+/**
+ * PDF.js disables real workers in Node and falls back to importing
+ * `./pdf.worker.mjs` at runtime. Vercel's serverless output tracing cannot
+ * see that webpack-ignored import, so the worker is loaded explicitly and
+ * registered on the global object before any document is opened.
+ */
+async function loadPdfJs() {
+  pdfJsModulePromise ??= (async () => {
+    const [pdfjs, worker] = await Promise.all([
+      import("pdfjs-dist/legacy/build/pdf.mjs"),
+      import("pdfjs-dist/legacy/build/pdf.worker.mjs")
+    ]);
+    const runtime = globalThis as typeof globalThis & { pdfjsWorker?: unknown };
+    runtime.pdfjsWorker ??= worker;
+    return pdfjs;
+  })();
+  return pdfJsModulePromise;
+}
+
 const arabicCharacterPattern = /[\u0600-\u06ff\u0750-\u077f\ufb50-\ufdff\ufe70-\ufeff]/g;
 const controlCharacterPattern = /[\u0000-\u001f\u007f]/g;
 
@@ -388,7 +411,7 @@ async function translatePdfVisually(input: Buffer, filename: string, source: "ar
   } catch {
     throw new Error("PDF_RENDERER_UNAVAILABLE");
   }
-  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const pdfjs = await loadPdfJs();
   const sourcePdf = await pdfjs.getDocument({ data: new Uint8Array(input) }).promise;
   const sourceDocument = await PDFDocument.load(input);
   const output = await PDFDocument.create();
@@ -472,7 +495,7 @@ async function translatePdf(input: Buffer, source: "ar" | "en", target: "ar" | "
   const document = await PDFDocument.load(input);
   const font = await loadFont(document);
   let changedBlocks = 0;
-  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const pdfjs = await loadPdfJs();
   const sourcePdf = await pdfjs.getDocument({ data: new Uint8Array(input) }).promise;
   const pages: PdfTextLine[][] = [];
   let extractedText = "";
