@@ -1,0 +1,14 @@
+import Link from "next/link";
+import UploadForm from "@/components/UploadForm";
+
+export default function HomePage() {
+  return <main>
+    <div className="container">
+      <nav className="nav"><Link href="/" className="brand"><span className="brand-mark">ت</span><span>ترجمة</span></Link><Link href="/admin" className="nav-link">لوحة الإدارة</Link></nav>
+      <section className="hero"><div><span className="eyebrow">خدمة مستندات سعودية، واضحة وآمنة</span><h1>ترجم مستندك،<br /><span style={{ color: "var(--blue)" }}>واحفظ شكله.</span></h1><p className="lead">ارفع ملفك واستلم ترجمة عربية أو إنجليزية مع المحافظة على الجداول والتنسيق قدر الإمكان، ومع خيار طلب الاعتماد بعد مراجعة بشرية.</p><div className="hero-actions"><a className="button" href="#upload">ارفع ملفك الآن</a><a className="button secondary" href="#how">كيف تعمل الخدمة؟</a></div></div><div className="hero-card"><div style={{ position:"relative", zIndex:1, opacity:.8, fontSize:13 }}>معاينة آمنة قبل الدفع</div><div className="doc-sheet"><h3>Document preview</h3><div className="doc-line" /><div className="doc-line" /><div className="doc-line short" /><div className="doc-line" /><div className="doc-line short" /><span className="doc-stamp">PREVIEW</span></div></div></section>
+      <section id="upload" className="section"><div className="section-title"><div><h2>ابدأ بطلبك</h2><p>أدخل البيانات وارفع المستند، وسيظهر لك السعر قبل المتابعة.</p></div></div><UploadForm /></section>
+      <section id="how" className="section"><div className="section-title"><div><h2>من الرفع إلى التسليم</h2><p>تدفق واضح بدون مفاجآت في السعر أو الملف النهائي.</p></div></div><div className="steps"><div className="step"><span className="step-no">١</span><h3>ارفع المستند</h3><p>PDF أو Word أو صورة، حتى 25MB.</p></div><div className="step"><span className="step-no">٢</span><h3>راجع المعاينة</h3><p>شاهد نتيجة العمل مع حماية مائية قبل الدفع.</p></div><div className="step"><span className="step-no">٣</span><h3>حوّل المبلغ</h3><p>اختر البنك أو Binance وارفع الإيصال.</p></div><div className="step"><span className="step-no">٤</span><h3>استلم النهائي</h3><p>يفتح الملف بعد التحقق، والاعتماد اختياري.</p></div></div></section>
+      <section className="section"><div className="panel" style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:18 }}><div><strong>خصوصية أولًا</strong><p className="panel-subtitle">ملفات خاصة وروابط تنزيل مؤقتة عند ربط التخزين السحابي.</p></div><div><strong>تنسيق مستندك</strong><p className="panel-subtitle">نستخدم معالجة موضعية للنص بدل إعادة تصميم الصفحة.</p></div><div><strong>اعتماد اختياري</strong><p className="panel-subtitle">المراجعة والختم لا يُضافان إلا بعد تأكيد الدفع.</p></div></div></section>
+    </div><footer><div className="container">ترجمة — خدمة ترجمة مستندات مستقلة · وثيقة العمل الحر: FL-289426120</div></footer>
+  </main>;
+}
