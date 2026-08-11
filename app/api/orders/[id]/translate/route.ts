@@ -19,10 +19,20 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     const input = await readPrivateFile(id, original.storageKey);
     const translated = await translateDocument(input, original.filename, order.sourceLanguage, order.targetLanguage);
     const working = await savePrivateFile(id, "translated_working", original.filename, translated.bytes);
-    const previewBytes = original.filename.toLowerCase().endsWith(".pdf") ? await addPdfWatermark(translated.bytes) : translated.bytes;
+    const isPdf = original.mimeType === "application/pdf" || /\.pdf$/i.test(original.filename);
+    const previewBytes = isPdf ? await addPdfWatermark(translated.bytes, `PREVIEW ONLY - NOT FOR DELIVERY - ${order.orderNumber}`) : translated.bytes;
     const preview = await savePrivateFile(id, "translated_preview", original.filename, previewBytes);
     const validation = buildValidationReport(translated.changedBlocks, order.pages);
-    const updated = await updateOrder(id, (current) => ({ ...current, status: "preview_ready", validation, files: [...current.files, { version: "translated_working", storageKey: working.storageKey, filename: original.filename, mimeType: original.mimeType, size: working.size, sha256: working.sha256, createdAt: new Date().toISOString() }, { version: "translated_preview", storageKey: preview.storageKey, filename: original.filename, mimeType: original.mimeType, size: preview.size, sha256: preview.sha256, createdAt: new Date().toISOString() }] }));
+    const updated = await updateOrder(id, (current) => ({
+      ...current,
+      status: "preview_ready",
+      validation,
+      files: [
+        ...current.files.filter((file) => file.version !== "translated_working" && file.version !== "translated_preview"),
+        { version: "translated_working", storageKey: working.storageKey, filename: original.filename, mimeType: original.mimeType, size: working.size, sha256: working.sha256, createdAt: new Date().toISOString() },
+        { version: "translated_preview", storageKey: preview.storageKey, filename: original.filename, mimeType: original.mimeType, size: preview.size, sha256: preview.sha256, createdAt: new Date().toISOString() }
+      ]
+    }));
     await addAudit("preview_generated", "customer", id, { changedBlocks: translated.changedBlocks });
     return NextResponse.json({ order: publicOrder(updated) });
   } catch (error) {

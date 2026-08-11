@@ -3,6 +3,7 @@ import path from "node:path";
 import AdmZip from "adm-zip";
 import fontkit from "@pdf-lib/fontkit";
 import { PDFDocument, StandardFonts, degrees, rgb } from "pdf-lib";
+import sharp from "sharp";
 import type { ValidationReport } from "./types";
 
 const glossary: Record<string, string> = {
@@ -49,11 +50,13 @@ async function translateText(text: string, source: "ar" | "en", target: "ar" | "
         messages: [{ role: "user", content: `Translate from ${source} to ${target}:\n${text}` }]
       })
     });
-    if (response.ok) {
-      const body = await response.json() as { content?: Array<{ text?: string }> };
-      return body.content?.map((part) => part.text || "").join("").trim() || text;
-    }
+    if (!response.ok) throw new Error(`TRANSLATION_PROVIDER_ANTHROPIC_${response.status}`);
+    const body = await response.json() as { content?: Array<{ text?: string }> };
+    const translated = body.content?.map((part) => part.text || "").join("").trim();
+    if (!translated) throw new Error("TRANSLATION_PROVIDER_EMPTY_RESPONSE");
+    return translated;
   }
+  if (process.env.AI_PROVIDER === "anthropic") throw new Error("TRANSLATION_REQUIRES_ANTHROPIC");
   if (process.env.AI_PROVIDER === "openai" && process.env.OPENAI_API_KEY) {
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -64,12 +67,188 @@ async function translateText(text: string, source: "ar" | "en", target: "ar" | "
         messages: [{ role: "system", content: "Translate precisely. Return only translation. Preserve names, numbers, dates, units, punctuation, and line breaks." }, { role: "user", content: `Translate from ${source} to ${target}:\n${text}` }]
       })
     });
-    if (response.ok) {
-      const body = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-      return body.choices?.[0]?.message?.content?.trim() || text;
-    }
+    if (!response.ok) throw new Error(`TRANSLATION_PROVIDER_OPENAI_${response.status}`);
+    const body = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+    const translated = body.choices?.[0]?.message?.content?.trim();
+    if (!translated) throw new Error("TRANSLATION_PROVIDER_EMPTY_RESPONSE");
+    return translated;
   }
-  return translateTextMock(text, source, target);
+  if (process.env.AI_PROVIDER === "openai") throw new Error("TRANSLATION_REQUIRES_OPENAI");
+  if (!process.env.AI_PROVIDER || process.env.AI_PROVIDER === "mock") return translateTextMock(text, source, target);
+  throw new Error("TRANSLATION_PROVIDER_NOT_CONFIGURED");
+}
+
+type ImageTextAlignment = "left" | "center" | "right";
+
+export interface ImageTextItem {
+  sourceText: string;
+  targetText: string;
+  box: { x: number; y: number; width: number; height: number };
+  backgroundColor?: string;
+  textColor?: string;
+  align?: ImageTextAlignment;
+  fontWeight?: "400" | "500" | "600" | "700";
+  fontSize?: number;
+}
+
+const imageExtensions = new Set(["jpg", "jpeg", "png", "webp"]);
+
+function imageMediaType(filename: string) {
+  const extension = filename.toLowerCase().split(".").pop();
+  if (extension === "png") return "image/png";
+  if (extension === "webp") return "image/webp";
+  return "image/jpeg";
+}
+
+function clamp(value: number, minimum: number, maximum: number) {
+  return Math.min(maximum, Math.max(minimum, value));
+}
+
+function safeHex(value: unknown, fallback: string) {
+  return typeof value === "string" && /^#[0-9a-f]{6}$/i.test(value) ? value : fallback;
+}
+
+function extractJson(value: string) {
+  const withoutFence = value.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  const firstObject = withoutFence.indexOf("{");
+  const lastObject = withoutFence.lastIndexOf("}");
+  if (firstObject < 0 || lastObject <= firstObject) throw new Error("IMAGE_TRANSLATION_INVALID_RESPONSE");
+  return JSON.parse(withoutFence.slice(firstObject, lastObject + 1)) as unknown;
+}
+
+function parseImageTextItems(value: unknown, width: number, height: number): ImageTextItem[] {
+  const entries = Array.isArray(value) ? value : value && typeof value === "object" && "items" in value && Array.isArray(value.items) ? value.items : [];
+  return entries.flatMap((entry) => {
+    if (!entry || typeof entry !== "object") return [];
+    const item = entry as Record<string, unknown>;
+    const rawBox = item.box ?? item.bounding_box ?? item.boundingBox;
+    if (!rawBox || typeof rawBox !== "object") return [];
+    const box = rawBox as Record<string, unknown>;
+    const values = [box.x, box.y, box.width ?? box.w, box.height ?? box.h].map(Number);
+    if (values.some((number) => !Number.isFinite(number))) return [];
+    const [rawX, rawY, rawWidth, rawHeight] = values;
+    const normalized = [rawX, rawY, rawWidth, rawHeight].every((number) => number >= 0 && number <= 1);
+    const x = normalized ? rawX * width : rawX;
+    const y = normalized ? rawY * height : rawY;
+    const itemWidth = normalized ? rawWidth * width : rawWidth;
+    const itemHeight = normalized ? rawHeight * height : rawHeight;
+    const clippedX = clamp(x, 0, width - 1);
+    const clippedY = clamp(y, 0, height - 1);
+    const clippedWidth = clamp(itemWidth, 1, width - clippedX);
+    const clippedHeight = clamp(itemHeight, 1, height - clippedY);
+    const sourceText = String(item.sourceText ?? item.source_text ?? "").trim();
+    const targetText = String(item.targetText ?? item.target_text ?? "").trim();
+    if (!sourceText || !targetText || sourceText === targetText) return [];
+    const align = item.align === "left" || item.align === "right" || item.align === "center" ? item.align : "center";
+    const fontWeight = item.fontWeight === "400" || item.fontWeight === "500" || item.fontWeight === "600" || item.fontWeight === "700" ? item.fontWeight : "600";
+    const requestedFontSize = Number(item.fontSize ?? item.font_size);
+    return [{
+      sourceText,
+      targetText,
+      box: { x: clippedX, y: clippedY, width: clippedWidth, height: clippedHeight },
+      backgroundColor: safeHex(item.backgroundColor ?? item.background_color, "#fffaf0"),
+      textColor: safeHex(item.textColor ?? item.text_color, "#7d4845"),
+      align,
+      fontWeight,
+      fontSize: Number.isFinite(requestedFontSize) ? clamp(requestedFontSize, 10, 160) : undefined
+    } satisfies ImageTextItem];
+  });
+}
+
+function escapeSvg(value: string) {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+
+function wrapSvgText(value: string, maximumCharacters: number) {
+  return value.split(/\r?\n/).flatMap((line) => {
+    const words = line.split(/\s+/).filter(Boolean);
+    if (!words.length) return [""];
+    const lines: string[] = [];
+    let current = "";
+    for (const word of words) {
+      const candidate = current ? `${current} ${word}` : word;
+      if (current && candidate.length > maximumCharacters) {
+        lines.push(current);
+        current = word;
+      } else {
+        current = candidate;
+      }
+    }
+    if (current) lines.push(current);
+    return lines;
+  });
+}
+
+function renderImageTextSvg(items: ImageTextItem[], width: number, height: number) {
+  const rendered = items.map((item) => {
+    const padding = Math.max(3, Math.min(16, item.box.height * 0.08));
+    const x = clamp(item.box.x - padding, 0, width - 1);
+    const y = clamp(item.box.y - padding, 0, height - 1);
+    const boxWidth = clamp(item.box.width + padding * 2, 1, width - x);
+    const boxHeight = clamp(item.box.height + padding * 2, 1, height - y);
+    const fontSize = item.fontSize ?? clamp(item.box.height * 0.56, 12, 96);
+    const lineHeight = fontSize * 1.18;
+    const lines = wrapSvgText(item.targetText, Math.max(8, Math.floor(boxWidth / (fontSize * 0.54))));
+    const textHeight = lines.length * lineHeight;
+    const startY = y + Math.max(fontSize, (boxHeight - textHeight) / 2 + fontSize * 0.88);
+    const textAnchor = item.align === "left" ? "start" : item.align === "right" ? "end" : "middle";
+    const textX = item.align === "left" ? x + padding : item.align === "right" ? x + boxWidth - padding : x + boxWidth / 2;
+    const text = lines.map((line, index) => `<tspan x="${textX.toFixed(2)}" y="${(startY + index * lineHeight).toFixed(2)}">${escapeSvg(line)}</tspan>`).join("");
+    return `<rect x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${boxWidth.toFixed(2)}" height="${boxHeight.toFixed(2)}" rx="${Math.min(12, padding).toFixed(2)}" fill="${item.backgroundColor}" fill-opacity="0.97"/><text x="${textX.toFixed(2)}" y="${startY.toFixed(2)}" text-anchor="${textAnchor}" font-family="Arial, Helvetica, sans-serif" font-size="${fontSize.toFixed(2)}px" font-weight="${item.fontWeight ?? "600"}" fill="${item.textColor}">${text}</text>`;
+  }).join("");
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">${rendered}</svg>`;
+}
+
+export async function renderTranslatedImage(input: Buffer, filename: string, items: ImageTextItem[]) {
+  if (!items.length) throw new Error("IMAGE_TRANSLATION_NO_TEXT");
+  const metadata = await sharp(input).metadata();
+  const width = metadata.width ?? 1;
+  const height = metadata.height ?? 1;
+  const overlay = Buffer.from(renderImageTextSvg(items, width, height));
+  const rendered = sharp(input).composite([{ input: overlay, left: 0, top: 0 }]);
+  const extension = filename.toLowerCase().split(".").pop();
+  if (extension === "png") return rendered.png().toBuffer();
+  if (extension === "webp") return rendered.webp({ quality: 95 }).toBuffer();
+  return rendered.jpeg({ quality: 95, chromaSubsampling: "4:4:4" }).toBuffer();
+}
+
+function imagePrompt(source: "ar" | "en", target: "ar" | "en") {
+  return `Translate every visible ${source === "ar" ? "Arabic" : "English"} text in this image into ${target === "ar" ? "Arabic" : "English"}. Return ONLY valid JSON in this exact shape: {"items":[{"source_text":"...","target_text":"...","box":{"x":0.0,"y":0.0,"width":0.0,"height":0.0},"background_color":"#ffffff","text_color":"#000000","align":"left","font_weight":"600"}]}. Coordinates must be normalized fractions of the full image from 0 to 1. Include only text that needs translation, including small footer text. Do not include icons, decorative marks, ratings stars, or text that is already in the target language. Preserve numbers, punctuation, brand names, and line breaks. Estimate the background and text colors from each text region. Do not add explanations or markdown.`;
+}
+
+async function prepareVisionImage(input: Buffer, filename: string) {
+  const metadata = await sharp(input).metadata();
+  const needsResize = input.byteLength > 7_000_000 || Math.max(metadata.width ?? 0, metadata.height ?? 0) > 1568;
+  if (!needsResize) return { data: input.toString("base64"), mediaType: imageMediaType(filename) };
+  const resized = await sharp(input).resize({ width: 1568, height: 1568, fit: "inside", withoutEnlargement: true }).jpeg({ quality: 90 }).toBuffer();
+  return { data: resized.toString("base64"), mediaType: "image/jpeg" };
+}
+
+async function translateImageWithAnthropic(input: Buffer, filename: string, source: "ar" | "en", target: "ar" | "en") {
+  const visionImage = await prepareVisionImage(input, filename);
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY || "", "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({
+      model: process.env.ANTHROPIC_TRANSLATION_MODEL || "claude-sonnet-4-5",
+      max_tokens: 2048,
+      system: "You are a precise image document translator. Never hallucinate text. Return only the requested JSON.",
+      messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: visionImage.mediaType, data: visionImage.data } }, { type: "text", text: imagePrompt(source, target) }] }]
+    })
+  });
+  if (!response.ok) throw new Error(`IMAGE_TRANSLATION_PROVIDER_${response.status}`);
+  const body = await response.json() as { content?: Array<{ type?: string; text?: string }> };
+  const text = body.content?.filter((part) => part.type === "text").map((part) => part.text || "").join("\n") || "";
+  const parsed = extractJson(text);
+  const metadata = await sharp(input).metadata();
+  const items = parseImageTextItems(parsed, metadata.width ?? 1, metadata.height ?? 1);
+  return { bytes: await renderTranslatedImage(input, filename, items), changedBlocks: items.length };
+}
+
+async function translateImage(input: Buffer, filename: string, source: "ar" | "en", target: "ar" | "en") {
+  if (source === target) return { bytes: input, changedBlocks: 0 };
+  if (process.env.AI_PROVIDER === "anthropic" && process.env.ANTHROPIC_API_KEY) return translateImageWithAnthropic(input, filename, source, target);
+  throw new Error("IMAGE_TRANSLATION_REQUIRES_ANTHROPIC");
 }
 
 const freelanceLetterEnglish = {
@@ -100,9 +279,140 @@ const freelanceLetterEnglish = {
   title: "Minister of Human Resources and Social Development"
 };
 
-function isFreelanceLetter(filename: string) {
+function isFreelanceLetter(filename: string, extractedText = "") {
   const normalized = filename.trim().toLowerCase();
-  return normalized.includes("شكر سلة") || normalized.includes("freelance");
+  if (normalized.includes("شكر سلة") || normalized.includes("freelance")) return true;
+  return extractedText.includes("ﷲ") && /freelance\.sa/i.test(extractedText);
+}
+
+interface PdfTextFragment {
+  text: string;
+  x: number;
+  baseline: number;
+  width: number;
+  height: number;
+  top: number;
+  bottom: number;
+}
+
+interface PdfTextLine {
+  text: string;
+  x: number;
+  width: number;
+  height: number;
+  top: number;
+  bottom: number;
+  baseline: number;
+  fragments: PdfTextFragment[];
+}
+
+const arabicCharacterPattern = /[\u0600-\u06ff\u0750-\u077f\ufb50-\ufdff\ufe70-\ufeff]/g;
+const controlCharacterPattern = /[\u0000-\u001f\u007f]/g;
+
+function groupPdfTextLines(items: unknown[], pageHeight: number, source: "ar" | "en") {
+  const fragments: PdfTextFragment[] = items.flatMap((item) => {
+    if (!item || typeof item !== "object" || !("str" in item) || !("transform" in item)) return [];
+    const candidate = item as { str?: unknown; transform?: unknown; width?: unknown; height?: unknown };
+    if (typeof candidate.str !== "string" || !candidate.str) return [];
+    if (!Array.isArray(candidate.transform) || candidate.transform.length < 6) return [];
+    const transform = candidate.transform.map(Number);
+    if (transform.some((value) => !Number.isFinite(value))) return [];
+    const height = Math.max(5, Number(candidate.height) || Math.abs(transform[3]) || 10);
+    const width = Math.max(1, Number(candidate.width) || candidate.str.length * height * 0.5);
+    const baseline = transform[5];
+    const top = pageHeight - baseline - height;
+    return [{ text: candidate.str, x: transform[4], baseline, width, height, top, bottom: top + height } satisfies PdfTextFragment];
+  });
+
+  const lines: PdfTextLine[] = [];
+  for (const fragment of fragments.sort((left, right) => left.top - right.top || left.x - right.x)) {
+    const line = lines.find((candidate) => Math.abs(candidate.baseline - fragment.baseline) <= Math.max(2, Math.min(candidate.height, fragment.height) * 0.45));
+    if (line) {
+      line.fragments.push(fragment);
+      line.x = Math.min(line.x, fragment.x);
+      line.width = Math.max(line.width, fragment.x + fragment.width - line.x);
+      line.height = Math.max(line.height, fragment.height);
+      line.top = Math.min(line.top, fragment.top);
+      line.bottom = Math.max(line.bottom, fragment.bottom);
+      continue;
+    }
+    lines.push({ text: "", x: fragment.x, width: fragment.width, height: fragment.height, top: fragment.top, bottom: fragment.bottom, baseline: fragment.baseline, fragments: [fragment] });
+  }
+
+  return lines
+    .sort((left, right) => left.top - right.top)
+    .map((line) => {
+      const ordered = [...line.fragments].sort((left, right) => source === "ar" ? right.x - left.x : left.x - right.x);
+      const text = ordered.map((fragment) => fragment.text).join("").replace(/\s+/g, " ").trim();
+      return { ...line, text };
+    })
+    .filter((line) => line.text.length > 0);
+}
+
+function isReadablePdfText(lines: PdfTextLine[], source: "ar" | "en") {
+  const text = lines.map((line) => line.text).join(" ");
+  if (!text.trim()) return false;
+  const controls = (text.match(controlCharacterPattern) || []).length;
+  if (controls > 0) return false;
+  if (source === "ar") return (text.match(arabicCharacterPattern) || []).length >= 2;
+  return /[A-Za-z]/.test(text);
+}
+
+function fittedTextSize(text: string, font: Awaited<ReturnType<PDFDocument["embedFont"]>>, maximumWidth: number, requestedSize: number) {
+  const singleLine = text.replace(/\r?\n/g, " ").trim();
+  const measured = font.widthOfTextAtSize(singleLine, requestedSize);
+  if (measured <= maximumWidth) return requestedSize;
+  return Math.max(6, requestedSize * maximumWidth / measured);
+}
+
+function drawTranslatedPdfLine(page: Awaited<ReturnType<PDFDocument["getPages"]>>[number], line: PdfTextLine, translated: string, font: Awaited<ReturnType<PDFDocument["embedFont"]>>) {
+  const padding = 1.5;
+  const width = Math.max(12, line.width + padding * 2);
+  const height = Math.max(7, line.bottom - line.top + padding * 2);
+  const x = Math.max(0, line.x - padding);
+  const y = Math.max(0, page.getHeight() - line.bottom - padding);
+  page.drawRectangle({ x, y, width: Math.min(width, page.getWidth() - x), height: Math.min(height, page.getHeight() - y), color: rgb(1, 1, 1), opacity: 0.98 });
+  const requestedSize = Math.min(22, Math.max(7, (line.bottom - line.top) * 0.78));
+  const size = fittedTextSize(translated, font, Math.max(12, line.width), requestedSize);
+  const textWidth = font.widthOfTextAtSize(translated.replace(/\r?\n/g, " ").trim(), size);
+  const textX = Math.max(0, x + Math.max(0, (width - textWidth) / 2));
+  const textY = y + Math.max(size, (height - size) / 2);
+  page.drawText(translated.replace(/\r?\n/g, " ").trim(), { x: textX, y: textY, size, font, color: rgb(0.05, 0.12, 0.2), maxWidth: Math.max(12, line.width) });
+}
+
+async function translatePdfVisually(input: Buffer, filename: string, source: "ar" | "en", target: "ar" | "en") {
+  if (!process.env.ANTHROPIC_API_KEY) throw new Error("PDF_TRANSLATION_REQUIRES_ANTHROPIC");
+  let canvasModule: typeof import("@napi-rs/canvas");
+  try {
+    canvasModule = await import("@napi-rs/canvas");
+  } catch {
+    throw new Error("PDF_RENDERER_UNAVAILABLE");
+  }
+  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const sourcePdf = await pdfjs.getDocument({ data: new Uint8Array(input) }).promise;
+  const sourceDocument = await PDFDocument.load(input);
+  const output = await PDFDocument.create();
+  let changedBlocks = 0;
+
+  for (let pageIndex = 0; pageIndex < sourcePdf.numPages; pageIndex += 1) {
+    const sourcePage = await sourcePdf.getPage(pageIndex + 1);
+    const baseViewport = sourcePage.getViewport({ scale: 1 });
+    const scale = Math.min(2, 1800 / Math.max(baseViewport.width, baseViewport.height));
+    const viewport = sourcePage.getViewport({ scale: Math.max(1.25, scale) });
+    const canvas = canvasModule.createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
+    const context = canvas.getContext("2d");
+    await sourcePage.render({ canvasContext: context, viewport, canvas } as never).promise;
+    const pagePng = canvas.toBuffer("image/png");
+    const translated = await translateImageWithAnthropic(pagePng, `${filename}.png`, source, target);
+    if (translated.changedBlocks <= 0) throw new Error("PDF_TRANSLATION_NO_TEXT");
+    changedBlocks += translated.changedBlocks;
+    const image = await output.embedPng(translated.bytes);
+    const originalPage = sourceDocument.getPages()[pageIndex];
+    const outputPage = output.addPage([originalPage.getWidth(), originalPage.getHeight()]);
+    outputPage.drawImage(image, { x: 0, y: 0, width: outputPage.getWidth(), height: outputPage.getHeight() });
+  }
+
+  return { bytes: Buffer.from(await output.save()), changedBlocks };
 }
 
 function drawCentered(page: Awaited<ReturnType<PDFDocument["getPages"]>>[number], text: string, font: Awaited<ReturnType<PDFDocument["embedFont"]>>, y: number, size: number, color = rgb(0.12, 0.12, 0.12)) {
@@ -158,37 +468,42 @@ async function loadFont(document: PDFDocument) {
 }
 
 async function translatePdf(input: Buffer, source: "ar" | "en", target: "ar" | "en", filename: string) {
+  if (source === target) return { bytes: input, changedBlocks: 0 };
   const document = await PDFDocument.load(input);
-  if (source === "ar" && target === "en" && isFreelanceLetter(filename)) {
-    return translateKnownFreelanceLetter(input);
-  }
   const font = await loadFont(document);
   let changedBlocks = 0;
-  try {
-    const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
-    const sourcePdf = await pdfjs.getDocument({ data: new Uint8Array(input) }).promise;
-    for (let pageIndex = 0; pageIndex < sourcePdf.numPages; pageIndex += 1) {
-      const page = document.getPages()[pageIndex];
-      const sourcePage = await sourcePdf.getPage(pageIndex + 1);
-      const content = await sourcePage.getTextContent();
-      for (const rawItem of content.items) {
-        if (!("str" in rawItem) || !rawItem.str.trim()) continue;
-        const translated = await translateText(rawItem.str, source, target);
-        if (translated === rawItem.str) continue;
-        const transform = rawItem.transform;
-        const x = transform[4];
-        const top = transform[5];
-        const height = Math.max(7, rawItem.height || Math.abs(transform[3]) || 10);
-        const width = Math.max(12, rawItem.width || rawItem.str.length * height * 0.5);
-        const y = page.getHeight() - top - height;
-        page.drawRectangle({ x: x - 1, y: y - 1, width: width + 3, height: height + 3, color: rgb(1, 1, 1), opacity: 0.96 });
-        page.drawText(translated, { x, y: y + 1, size: Math.min(22, height), font, color: rgb(0.05, 0.12, 0.2), maxWidth: width + 1 });
-        changedBlocks += 1;
-      }
-    }
-  } catch {
-    // Keep the original bytes intact if a PDF has unsupported text internals.
+  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const sourcePdf = await pdfjs.getDocument({ data: new Uint8Array(input) }).promise;
+  const pages: PdfTextLine[][] = [];
+  let extractedText = "";
+
+  for (let pageIndex = 0; pageIndex < sourcePdf.numPages; pageIndex += 1) {
+    const sourcePage = await sourcePdf.getPage(pageIndex + 1);
+    const content = await sourcePage.getTextContent();
+    const lines = groupPdfTextLines(content.items, sourcePage.getViewport({ scale: 1 }).height, source);
+    pages.push(lines);
+    extractedText += `${lines.map((line) => line.text).join(" ")}\n`;
   }
+
+  if (source === "ar" && target === "en" && isFreelanceLetter(filename, extractedText) && document.getPageCount() === 1) {
+    return translateKnownFreelanceLetter(input);
+  }
+
+  if (!pages.flat().length || !pages.every((lines) => isReadablePdfText(lines, source))) {
+    return translatePdfVisually(input, filename, source, target);
+  }
+
+  for (let pageIndex = 0; pageIndex < pages.length; pageIndex += 1) {
+    const page = document.getPages()[pageIndex];
+    for (const line of pages[pageIndex]) {
+      const translated = await translateText(line.text, source, target);
+      if (translated.trim() === line.text.trim()) continue;
+      drawTranslatedPdfLine(page, line, translated, font);
+      changedBlocks += 1;
+    }
+  }
+
+  if (changedBlocks === 0) throw new Error("PDF_TRANSLATION_NO_CHANGES");
   return { bytes: Buffer.from(await document.save()), changedBlocks };
 }
 
@@ -220,16 +535,37 @@ export async function analyzeDocument(input: Buffer, filename: string) {
 export async function translateDocument(input: Buffer, filename: string, source: "ar" | "en", target: "ar" | "en") {
   const extension = filename.toLowerCase().split(".").pop();
   if (extension === "pdf") return translatePdf(input, source, target, filename);
-  if (extension === "docx") return translateDocx(input, source, target);
-  return { bytes: input, changedBlocks: 0 };
+  if (extension === "docx") {
+    if (source === target) return { bytes: input, changedBlocks: 0 };
+    const translated = await translateDocx(input, source, target);
+    if (translated.changedBlocks === 0) throw new Error("DOCX_TRANSLATION_NO_CHANGES");
+    return translated;
+  }
+  if (imageExtensions.has(extension || "")) return translateImage(input, filename, source, target);
+  throw new Error("UNSUPPORTED_DOCUMENT");
 }
 
-export async function addPdfWatermark(input: Buffer, label = "معاينة - ترجمة") {
+export async function addPdfWatermark(input: Buffer, label = "PREVIEW ONLY - NOT FOR DELIVERY") {
   const document = await PDFDocument.load(input);
-  const font = await loadFont(document);
+  const font = await document.embedFont(StandardFonts.Helvetica);
   for (const page of document.getPages()) {
-    page.drawText(label, { x: page.getWidth() * 0.1, y: page.getHeight() * 0.44, size: 30, rotate: degrees(28), color: rgb(0.12, 0.2, 0.3), opacity: 0.18, font });
-    page.drawText(label, { x: page.getWidth() * 0.5, y: page.getHeight() * 0.12, size: 18, rotate: degrees(28), color: rgb(0.12, 0.2, 0.3), opacity: 0.18, font });
+    const tiledLabel = label;
+    const size = Math.min(31, Math.max(18, page.getWidth() / 19));
+    const stepX = Math.max(180, page.getWidth() * 0.52);
+    const stepY = Math.max(120, page.getHeight() * 0.22);
+    for (let row = -1; row < Math.ceil(page.getHeight() / stepY) + 1; row += 1) {
+      for (let column = -1; column < Math.ceil(page.getWidth() / stepX) + 1; column += 1) {
+        page.drawText(tiledLabel, {
+          x: column * stepX + page.getWidth() * 0.04,
+          y: row * stepY + page.getHeight() * 0.08,
+          size,
+          rotate: degrees(28),
+          color: rgb(0.12, 0.2, 0.3),
+          opacity: 0.14,
+          font
+        });
+      }
+    }
   }
   return Buffer.from(await document.save());
 }
