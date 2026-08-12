@@ -11,6 +11,7 @@ describe("document engine", () => {
   it("uses a deterministic mock glossary without touching unknown text", () => {
     expect(translateTextMock("Invoice", "en", "ar")).toBe("فاتورة");
     expect(translateTextMock("Unlisted phrase", "en", "ar")).toBe("Unlisted phrase");
+    expect(translateTextMock("Invoice 123 - $45.00", "en", "ar")).toBe("فاتورة 123 - $45.00");
   });
   it("returns an explicit safety report", () => {
     expect(buildValidationReport(4, 1).formatting).toBe("PASS");

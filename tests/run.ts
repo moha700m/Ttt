@@ -40,12 +40,13 @@ await test("attached salon image renders an English translation layer", async ()
   assert.equal((await analyzeDocument(translated, "salon.jpeg")).kind, "image");
 });
 await test("mock glossary translates known text", () => assert.equal(translateTextMock("Invoice", "en", "ar"), "فاتورة"));
+await test("mock glossary preserves mixed numbers and symbols", () => assert.equal(translateTextMock("Invoice 123 - $45.00", "en", "ar"), "فاتورة 123 - $45.00"));
 await test("mock glossary preserves unknown text", () => assert.equal(translateTextMock("Unlisted phrase", "en", "ar"), "Unlisted phrase"));
 await test("validation report is explicit", () => assert.equal(buildValidationReport(4, 1).formatting, "PASS"));
 await test("capability token is hashed", () => { assert.notEqual(hashToken("secret"), "secret"); assert.equal(hashToken("secret").length, 64); });
 await test("filename is normalized", () => assert.equal(safeFilename("../../secret file.pdf"), ".._.._secret_file.pdf"));
 await test("SHA256 is stable", () => assert.equal(sha256("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
-console.log(`\n${passed}/11 checks passed`);
+console.log(`\n${passed}/12 checks passed`);
 }
 
 main().catch((error) => { console.error(error); process.exitCode = 1; });

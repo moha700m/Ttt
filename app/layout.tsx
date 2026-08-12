@@ -1,5 +1,6 @@
 import "@fontsource/noto-sans-arabic/400.css";
 import "@fontsource/noto-sans-arabic/600.css";
+import "@fontsource/noto-sans/400.css";
 import "./globals.css";
 import type { Metadata } from "next";
 

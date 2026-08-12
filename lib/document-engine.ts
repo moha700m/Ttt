@@ -1,8 +1,9 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import AdmZip from "adm-zip";
+import bidiFactory from "bidi-js";
 import fontkit from "@pdf-lib/fontkit";
-import { PDFDocument, StandardFonts, degrees, rgb } from "pdf-lib";
+import { PDFDocument, degrees, rgb } from "pdf-lib";
 import sharp from "sharp";
 import type { ValidationReport } from "./types";
 
@@ -30,12 +31,25 @@ function unescapeXml(value: string) {
   return value.replace(/&apos;/g, "'").replace(/&quot;/g, '"').replace(/&gt;/g, ">").replace(/&lt;/g, "<").replace(/&amp;/g, "&");
 }
 
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function replaceGlossaryTerms(text: string, entries: Array<[string, string]>) {
+  return entries
+    .sort(([left], [right]) => right.length - left.length)
+    .reduce((value, [source, target]) => {
+      const pattern = new RegExp(`(?<![\\p{L}\\p{M}])${escapeRegExp(source)}(?![\\p{L}\\p{M}])`, "giu");
+      return value.replace(pattern, target);
+    }, text);
+}
+
 export function translateTextMock(text: string, source: "ar" | "en", target: "ar" | "en") {
   if (source === target) return text;
   const key = text.trim().toLowerCase();
-  if (target === "ar") return glossary[key] ?? text;
-  const reverse = Object.entries(glossary).find(([, value]) => value === text.trim());
-  return reverse?.[0] ?? text;
+  if (target === "ar") return glossary[key] ?? replaceGlossaryTerms(text, Object.entries(glossary));
+  const reverse = Object.entries(glossary).map(([english, arabic]) => [arabic, english] as [string, string]);
+  return reverse.find(([arabic]) => arabic === text.trim())?.[1] ?? replaceGlossaryTerms(text, reverse);
 }
 
 async function translateText(text: string, source: "ar" | "en", target: "ar" | "en") {
@@ -92,6 +106,95 @@ export interface ImageTextItem {
 }
 
 const imageExtensions = new Set(["jpg", "jpeg", "png", "webp"]);
+const arabicCharacterPattern = /[\u0600-\u06ff\u0750-\u077f\ufb50-\ufdff\ufe70-\ufeff]/gu;
+const arabicCharacterTestPattern = /[\u0600-\u06ff\u0750-\u077f\ufb50-\ufdff\ufe70-\ufeff]/u;
+const bidi = bidiFactory();
+
+type EmbeddedPdfFont = Awaited<ReturnType<PDFDocument["embedFont"]>>;
+interface EmbeddedPdfFonts {
+  arabic: EmbeddedPdfFont;
+  latin: EmbeddedPdfFont;
+}
+
+type BundledFontKind = "arabic" | "latin";
+
+const bundledFontCandidates: Record<BundledFontKind, string[]> = {
+  arabic: [
+    path.join(process.cwd(), "assets/fonts/NotoSansArabic-Regular.ttf"),
+    path.join(process.cwd(), "node_modules/@fontsource/noto-sans-arabic/files/noto-sans-arabic-arabic-400-normal.woff"),
+    ...(process.env.ARABIC_FONT_PATH ? [process.env.ARABIC_FONT_PATH] : [])
+  ],
+  latin: [
+    path.join(process.cwd(), "assets/fonts/NotoSans-Variable.ttf")
+  ]
+};
+
+const bundledFontBytes = new Map<BundledFontKind, Promise<Buffer>>();
+
+async function readBundledFont(kind: BundledFontKind) {
+  const cached = bundledFontBytes.get(kind);
+  if (cached) return cached;
+  const pending = (async () => {
+    let lastError: unknown;
+    for (const candidate of bundledFontCandidates[kind]) {
+      try {
+        return await fs.readFile(candidate);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    const detail = lastError instanceof Error ? `: ${lastError.message}` : "";
+    throw new Error(`BUNDLED_${kind.toUpperCase()}_FONT_UNAVAILABLE${detail}`);
+  })();
+  bundledFontBytes.set(kind, pending);
+  return pending;
+}
+
+async function loadPdfFonts(document: PDFDocument): Promise<EmbeddedPdfFonts> {
+  document.registerFontkit(fontkit);
+  const [arabic, latin] = await Promise.all([readBundledFont("arabic"), readBundledFont("latin")]);
+  return { arabic: await document.embedFont(arabic), latin: await document.embedFont(latin) };
+}
+
+function containsArabic(value: string) {
+  return arabicCharacterTestPattern.test(value);
+}
+
+function reorderForPdf(value: string) {
+  const normalized = value.replace(/\r?\n/g, " ").replace(/\s+/g, " ").trim();
+  if (!normalized || !containsArabic(normalized)) return normalized;
+  return bidi.getReorderedString(normalized, bidi.getEmbeddingLevels(normalized));
+}
+
+function splitPdfTextRuns(value: string, fonts: EmbeddedPdfFonts) {
+  const visual = reorderForPdf(value);
+  const runs: Array<{ text: string; font: EmbeddedPdfFont }> = [];
+  let current = "";
+  let currentIsArabic: boolean | undefined;
+  for (const character of visual) {
+    const isArabic = arabicCharacterTestPattern.test(character);
+    if (current && currentIsArabic !== isArabic) {
+      runs.push({ text: current, font: currentIsArabic ? fonts.arabic : fonts.latin });
+      current = "";
+    }
+    currentIsArabic = isArabic;
+    current += character;
+  }
+  if (current) runs.push({ text: current, font: currentIsArabic ? fonts.arabic : fonts.latin });
+  return runs;
+}
+
+function measurePdfText(value: string, fonts: EmbeddedPdfFonts, size: number) {
+  return splitPdfTextRuns(value, fonts).reduce((width, run) => width + run.font.widthOfTextAtSize(run.text, size), 0);
+}
+
+function drawPdfText(page: Awaited<ReturnType<PDFDocument["getPages"]>>[number], value: string, fonts: EmbeddedPdfFonts, options: { x: number; y: number; size: number; color: ReturnType<typeof rgb>; opacity?: number; rotate?: ReturnType<typeof degrees> }) {
+  let x = options.x;
+  for (const run of splitPdfTextRuns(value, fonts)) {
+    page.drawText(run.text, { ...options, x, font: run.font });
+    x += run.font.widthOfTextAtSize(run.text, options.size);
+  }
+}
 
 function imageMediaType(filename: string) {
   const extension = filename.toLowerCase().split(".").pop();
@@ -179,7 +282,8 @@ function wrapSvgText(value: string, maximumCharacters: number) {
   });
 }
 
-function renderImageTextSvg(items: ImageTextItem[], width: number, height: number) {
+function renderImageTextSvg(items: ImageTextItem[], width: number, height: number, fonts: { arabic: Buffer; latin: Buffer }) {
+  const fontStyles = `<style>@font-face{font-family:'Tarjamah Noto Arabic';src:url(data:font/ttf;base64,${fonts.arabic.toString("base64")}) format('truetype');font-weight:400;}@font-face{font-family:'Tarjamah Noto Latin';src:url(data:font/ttf;base64,${fonts.latin.toString("base64")}) format('truetype');font-weight:400;}</style>`;
   const rendered = items.map((item) => {
     const padding = Math.max(3, Math.min(16, item.box.height * 0.08));
     const x = clamp(item.box.x - padding, 0, width - 1);
@@ -191,12 +295,14 @@ function renderImageTextSvg(items: ImageTextItem[], width: number, height: numbe
     const lines = wrapSvgText(item.targetText, Math.max(8, Math.floor(boxWidth / (fontSize * 0.54))));
     const textHeight = lines.length * lineHeight;
     const startY = y + Math.max(fontSize, (boxHeight - textHeight) / 2 + fontSize * 0.88);
-    const textAnchor = item.align === "left" ? "start" : item.align === "right" ? "end" : "middle";
+    const isArabic = containsArabic(item.targetText);
+    const textAnchor = item.align === "left" ? "start" : item.align === "right" ? (isArabic ? "start" : "end") : "middle";
     const textX = item.align === "left" ? x + padding : item.align === "right" ? x + boxWidth - padding : x + boxWidth / 2;
     const text = lines.map((line, index) => `<tspan x="${textX.toFixed(2)}" y="${(startY + index * lineHeight).toFixed(2)}">${escapeSvg(line)}</tspan>`).join("");
-    return `<rect x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${boxWidth.toFixed(2)}" height="${boxHeight.toFixed(2)}" rx="${Math.min(12, padding).toFixed(2)}" fill="${item.backgroundColor}" fill-opacity="0.97"/><text x="${textX.toFixed(2)}" y="${startY.toFixed(2)}" text-anchor="${textAnchor}" font-family="Arial, Helvetica, sans-serif" font-size="${fontSize.toFixed(2)}px" font-weight="${item.fontWeight ?? "600"}" fill="${item.textColor}">${text}</text>`;
+    const direction = isArabic ? "rtl" : "ltr";
+    return `<rect x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${boxWidth.toFixed(2)}" height="${boxHeight.toFixed(2)}" rx="${Math.min(12, padding).toFixed(2)}" fill="${item.backgroundColor}" fill-opacity="0.97"/><text x="${textX.toFixed(2)}" y="${startY.toFixed(2)}" text-anchor="${textAnchor}" direction="${direction}" unicode-bidi="plaintext" font-family="'Tarjamah Noto Arabic', 'Tarjamah Noto Latin'" font-size="${fontSize.toFixed(2)}px" font-weight="${item.fontWeight ?? "600"}" fill="${item.textColor}">${text}</text>`;
   }).join("");
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">${rendered}</svg>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">${fontStyles}${rendered}</svg>`;
 }
 
 export async function renderTranslatedImage(input: Buffer, filename: string, items: ImageTextItem[]) {
@@ -204,7 +310,8 @@ export async function renderTranslatedImage(input: Buffer, filename: string, ite
   const metadata = await sharp(input).metadata();
   const width = metadata.width ?? 1;
   const height = metadata.height ?? 1;
-  const overlay = Buffer.from(renderImageTextSvg(items, width, height));
+  const fonts = { arabic: await readBundledFont("arabic"), latin: await readBundledFont("latin") };
+  const overlay = Buffer.from(renderImageTextSvg(items, width, height, fonts));
   const rendered = sharp(input).composite([{ input: overlay, left: 0, top: 0 }]);
   const extension = filename.toLowerCase().split(".").pop();
   if (extension === "png") return rendered.png().toBuffer();
@@ -329,7 +436,18 @@ async function loadPdfJs() {
   return pdfJsModulePromise;
 }
 
-const arabicCharacterPattern = /[\u0600-\u06ff\u0750-\u077f\ufb50-\ufdff\ufe70-\ufeff]/g;
+function pdfJsDocumentOptions(data: Uint8Array) {
+  const pdfjsRoot = path.join(process.cwd(), "node_modules/pdfjs-dist");
+  const pdfjsDirectory = (name: string) => `${path.join(pdfjsRoot, name).replaceAll("\\", "/")}/`;
+  return {
+    data,
+    standardFontDataUrl: pdfjsDirectory("standard_fonts"),
+    cMapUrl: pdfjsDirectory("cmaps"),
+    cMapPacked: true,
+    useWorkerFetch: false
+  };
+}
+
 const controlCharacterPattern = /[\u0000-\u001f\u007f]/g;
 
 function groupPdfTextLines(items: unknown[], pageHeight: number, source: "ar" | "en") {
@@ -381,14 +499,13 @@ function isReadablePdfText(lines: PdfTextLine[], source: "ar" | "en") {
   return /[A-Za-z]/.test(text);
 }
 
-function fittedTextSize(text: string, font: Awaited<ReturnType<PDFDocument["embedFont"]>>, maximumWidth: number, requestedSize: number) {
-  const singleLine = text.replace(/\r?\n/g, " ").trim();
-  const measured = font.widthOfTextAtSize(singleLine, requestedSize);
+function fittedTextSize(text: string, fonts: EmbeddedPdfFonts, maximumWidth: number, requestedSize: number) {
+  const measured = measurePdfText(text, fonts, requestedSize);
   if (measured <= maximumWidth) return requestedSize;
   return Math.max(6, requestedSize * maximumWidth / measured);
 }
 
-function drawTranslatedPdfLine(page: Awaited<ReturnType<PDFDocument["getPages"]>>[number], line: PdfTextLine, translated: string, font: Awaited<ReturnType<PDFDocument["embedFont"]>>) {
+function drawTranslatedPdfLine(page: Awaited<ReturnType<PDFDocument["getPages"]>>[number], line: PdfTextLine, translated: string, fonts: EmbeddedPdfFonts) {
   const padding = 1.5;
   const width = Math.max(12, line.width + padding * 2);
   const height = Math.max(7, line.bottom - line.top + padding * 2);
@@ -396,11 +513,11 @@ function drawTranslatedPdfLine(page: Awaited<ReturnType<PDFDocument["getPages"]>
   const y = Math.max(0, page.getHeight() - line.bottom - padding);
   page.drawRectangle({ x, y, width: Math.min(width, page.getWidth() - x), height: Math.min(height, page.getHeight() - y), color: rgb(1, 1, 1), opacity: 0.98 });
   const requestedSize = Math.min(22, Math.max(7, (line.bottom - line.top) * 0.78));
-  const size = fittedTextSize(translated, font, Math.max(12, line.width), requestedSize);
-  const textWidth = font.widthOfTextAtSize(translated.replace(/\r?\n/g, " ").trim(), size);
+  const size = fittedTextSize(translated, fonts, Math.max(12, line.width), requestedSize);
+  const textWidth = measurePdfText(translated, fonts, size);
   const textX = Math.max(0, x + Math.max(0, (width - textWidth) / 2));
   const textY = y + Math.max(size, (height - size) / 2);
-  page.drawText(translated.replace(/\r?\n/g, " ").trim(), { x: textX, y: textY, size, font, color: rgb(0.05, 0.12, 0.2), maxWidth: Math.max(12, line.width) });
+  drawPdfText(page, translated, fonts, { x: textX, y: textY, size, color: rgb(0.05, 0.12, 0.2) });
 }
 
 async function translatePdfVisually(input: Buffer, filename: string, source: "ar" | "en", target: "ar" | "en") {
@@ -412,7 +529,7 @@ async function translatePdfVisually(input: Buffer, filename: string, source: "ar
     throw new Error("PDF_RENDERER_UNAVAILABLE");
   }
   const pdfjs = await loadPdfJs();
-  const sourcePdf = await pdfjs.getDocument({ data: new Uint8Array(input) }).promise;
+  const sourcePdf = await pdfjs.getDocument(pdfJsDocumentOptions(new Uint8Array(input))).promise;
   const sourceDocument = await PDFDocument.load(input);
   const output = await PDFDocument.create();
   let changedBlocks = 0;
@@ -438,9 +555,9 @@ async function translatePdfVisually(input: Buffer, filename: string, source: "ar
   return { bytes: Buffer.from(await output.save()), changedBlocks };
 }
 
-function drawCentered(page: Awaited<ReturnType<PDFDocument["getPages"]>>[number], text: string, font: Awaited<ReturnType<PDFDocument["embedFont"]>>, y: number, size: number, color = rgb(0.12, 0.12, 0.12)) {
-  const width = font.widthOfTextAtSize(text, size);
-  page.drawText(text, { x: Math.max(24, (page.getWidth() - width) / 2), y, size, font, color });
+function drawCentered(page: Awaited<ReturnType<PDFDocument["getPages"]>>[number], text: string, fonts: EmbeddedPdfFonts, y: number, size: number, color = rgb(0.12, 0.12, 0.12)) {
+  const width = measurePdfText(text, fonts, size);
+  drawPdfText(page, text, fonts, { x: Math.max(24, (page.getWidth() - width) / 2), y, size, color });
 }
 
 function coverRegion(page: Awaited<ReturnType<PDFDocument["getPages"]>>[number], top: number, bottom: number, left = 22, right = 573) {
@@ -450,7 +567,7 @@ function coverRegion(page: Awaited<ReturnType<PDFDocument["getPages"]>>[number],
 async function translateKnownFreelanceLetter(input: Buffer) {
   const document = await PDFDocument.load(input);
   const page = document.getPages()[0];
-  const font = await document.embedFont(StandardFonts.Helvetica);
+  const fonts = await loadPdfFonts(document);
   const ink = rgb(0.12, 0.12, 0.12);
 
   coverRegion(page, 128, 170, 275, 573);
@@ -461,42 +578,25 @@ async function translateKnownFreelanceLetter(input: Buffer) {
   coverRegion(page, 590, 635, 120, 475);
   coverRegion(page, 672, 732, 22, 300);
 
-  drawCentered(page, freelanceLetterEnglish.heading, font, 682, 18, ink);
-  drawCentered(page, freelanceLetterEnglish.greeting, font, 650, 11.5, ink);
-  freelanceLetterEnglish.body.forEach((line, index) => drawCentered(page, line, font, 615 - index * 13, 9.8, ink));
-  freelanceLetterEnglish.bullets.forEach((line, index) => page.drawText(`- ${line}`, { x: 58, y: 493 - index * 20, size: 9.2, font, color: ink, maxWidth: 510 }));
-  freelanceLetterEnglish.contact.forEach((line, index) => drawCentered(page, line, font, 323 - index * 16, 10.2, ink));
-  drawCentered(page, freelanceLetterEnglish.closing, font, 225, 11.5, ink);
-  page.drawText(freelanceLetterEnglish.signer, { x: 36, y: 145, size: 10.2, font, color: ink });
-  page.drawText(freelanceLetterEnglish.title, { x: 36, y: 126, size: 9.3, font, color: ink, maxWidth: 265 });
+  drawCentered(page, freelanceLetterEnglish.heading, fonts, 682, 18, ink);
+  drawCentered(page, freelanceLetterEnglish.greeting, fonts, 650, 11.5, ink);
+  freelanceLetterEnglish.body.forEach((line, index) => drawCentered(page, line, fonts, 615 - index * 13, 9.8, ink));
+  freelanceLetterEnglish.bullets.forEach((line, index) => drawPdfText(page, `- ${line}`, fonts, { x: 58, y: 493 - index * 20, size: 9.2, color: ink }));
+  freelanceLetterEnglish.contact.forEach((line, index) => drawCentered(page, line, fonts, 323 - index * 16, 10.2, ink));
+  drawCentered(page, freelanceLetterEnglish.closing, fonts, 225, 11.5, ink);
+  drawPdfText(page, freelanceLetterEnglish.signer, fonts, { x: 36, y: 145, size: 10.2, color: ink });
+  drawPdfText(page, freelanceLetterEnglish.title, fonts, { x: 36, y: 126, size: 9.3, color: ink });
 
   return { bytes: Buffer.from(await document.save()), changedBlocks: 8 };
-}
-
-async function loadFont(document: PDFDocument) {
-  document.registerFontkit(fontkit);
-  let lastError: unknown;
-  const candidates = [
-    process.env.ARABIC_FONT_PATH,
-    path.join(process.cwd(), "assets/fonts/NotoSansArabic-Regular.ttf"),
-    path.join(process.cwd(), "node_modules/@fontsource/noto-sans-arabic/files/noto-sans-arabic-arabic-400-normal.ttf"),
-    path.join(process.cwd(), "node_modules/@fontsource/noto-sans-arabic/files/noto-sans-arabic-arabic-400-normal.woff"),
-    path.join(process.cwd(), "node_modules/@fontsource/noto-sans-arabic/files/noto-sans-arabic-arabic-400-normal.woff2")
-  ].filter(Boolean) as string[];
-  for (const candidate of candidates) {
-    try { return document.embedFont(await fs.readFile(candidate)); } catch (error) { lastError = error; }
-  }
-  if (lastError instanceof Error) throw new Error(`ARABIC_FONT_UNAVAILABLE: ${lastError.message}`);
-  return document.embedFont(StandardFonts.Helvetica);
 }
 
 async function translatePdf(input: Buffer, source: "ar" | "en", target: "ar" | "en", filename: string) {
   if (source === target) return { bytes: input, changedBlocks: 0 };
   const document = await PDFDocument.load(input);
-  const font = await loadFont(document);
+  const fonts = await loadPdfFonts(document);
   let changedBlocks = 0;
   const pdfjs = await loadPdfJs();
-  const sourcePdf = await pdfjs.getDocument({ data: new Uint8Array(input) }).promise;
+  const sourcePdf = await pdfjs.getDocument(pdfJsDocumentOptions(new Uint8Array(input))).promise;
   const pages: PdfTextLine[][] = [];
   let extractedText = "";
 
@@ -521,7 +621,7 @@ async function translatePdf(input: Buffer, source: "ar" | "en", target: "ar" | "
     for (const line of pages[pageIndex]) {
       const translated = await translateText(line.text, source, target);
       if (translated.trim() === line.text.trim()) continue;
-      drawTranslatedPdfLine(page, line, translated, font);
+      drawTranslatedPdfLine(page, line, translated, fonts);
       changedBlocks += 1;
     }
   }
@@ -570,7 +670,7 @@ export async function translateDocument(input: Buffer, filename: string, source:
 
 export async function addPdfWatermark(input: Buffer, label = "PREVIEW ONLY - NOT FOR DELIVERY") {
   const document = await PDFDocument.load(input);
-  const font = await document.embedFont(StandardFonts.Helvetica);
+  const fonts = await loadPdfFonts(document);
   for (const page of document.getPages()) {
     const tiledLabel = label;
     const size = Math.min(31, Math.max(18, page.getWidth() / 19));
@@ -585,7 +685,7 @@ export async function addPdfWatermark(input: Buffer, label = "PREVIEW ONLY - NOT
           rotate: degrees(28),
           color: rgb(0.12, 0.2, 0.3),
           opacity: 0.14,
-          font
+          font: fonts.latin
         });
       }
     }
@@ -595,7 +695,7 @@ export async function addPdfWatermark(input: Buffer, label = "PREVIEW ONLY - NOT
 
 export async function certifyPdf(input: Buffer) {
   const document = await PDFDocument.load(input);
-  const font = await loadFont(document);
+  const fonts = await loadPdfFonts(document);
   const stamp = process.env.CERTIFICATION_STAMP_BASE64;
   let image: Awaited<ReturnType<PDFDocument["embedPng"]>> | undefined;
   if (stamp) {
@@ -604,7 +704,7 @@ export async function certifyPdf(input: Buffer) {
   }
   for (const page of document.getPages()) {
     if (image) page.drawImage(image, { x: page.getWidth() - 130, y: 24, width: 96, height: 96, opacity: 0.9 });
-    else page.drawText("ترجمة معتمدة", { x: page.getWidth() - 150, y: 38, size: 13, color: rgb(0.03, 0.2, 0.32), font });
+    else drawPdfText(page, "ترجمة معتمدة", fonts, { x: page.getWidth() - 150, y: 38, size: 13, color: rgb(0.03, 0.2, 0.32) });
   }
   return Buffer.from(await document.save());
 }
