@@ -3,6 +3,7 @@ import path from "node:path";
 import AdmZip from "adm-zip";
 import bidiFactory from "bidi-js";
 import fontkit from "@pdf-lib/fontkit";
+import { createCanvas, GlobalFonts } from "@napi-rs/canvas";
 import { PDFDocument, degrees, rgb } from "pdf-lib";
 import sharp from "sharp";
 import type { ValidationReport } from "./types";
@@ -787,32 +788,44 @@ function docxPreviewTextLines(text: string, width: number, fontSize: number) {
   return wrapSvgText(text, Math.max(10, Math.floor(width / (fontSize * 0.52))));
 }
 
-function docxPreviewTextSvg(text: string, x: number, y: number, width: number, fontSize: number, align: "left" | "center" | "right", color: string, weight = "400") {
-  const lines = docxPreviewTextLines(text, width, fontSize);
-  const direction = containsArabic(text) ? "rtl" : "ltr";
-  const anchor = align === "center" ? "middle" : align === "right" ? "end" : "start";
-  const lineHeight = fontSize * 1.38;
-  const tspans = lines.map((line, index) => `<tspan x="${x.toFixed(2)}" y="${(y + index * lineHeight).toFixed(2)}">${escapeXml(line)}</tspan>`).join("");
-  return { svg: `<text x="${x.toFixed(2)}" y="${y.toFixed(2)}" text-anchor="${anchor}" direction="${direction}" unicode-bidi="plaintext" font-family="'Tarjamah Noto Arabic', 'Tarjamah Noto Latin'" font-size="${fontSize.toFixed(2)}px" font-weight="${weight}" fill="${color}">${tspans}</text>`, height: lines.length * lineHeight };
+function registerDocxPreviewFonts() {
+  const arabicPath = path.join(process.cwd(), "assets/fonts/NotoSansArabic-Regular.ttf");
+  const latinPath = path.join(process.cwd(), "assets/fonts/NotoSans-Variable.ttf");
+  try {
+    GlobalFonts.registerFromPath(arabicPath, "Tarjamah Arabic");
+    GlobalFonts.registerFromPath(latinPath, "Tarjamah Latin");
+  } catch {
+    throw new Error("DOCX_PREVIEW_FONT_UNAVAILABLE");
+  }
 }
 
 async function renderDocxPreviewPage(blocks: DocxPreviewBlock[], pageNumber: number, totalPages: number) {
   const width = 1224;
   const height = 1584;
   const margin = 96;
-  const fonts = { arabic: await readBundledFont("arabic"), latin: await readBundledFont("latin") };
-  const parts = [
-    `<style>@font-face{font-family:'Tarjamah Noto Arabic';src:url(data:font/ttf;base64,${fonts.arabic.toString("base64")}) format('truetype');font-weight:400;}@font-face{font-family:'Tarjamah Noto Latin';src:url(data:font/ttf;base64,${fonts.latin.toString("base64")}) format('truetype');font-weight:400;}</style>`,
-    `<rect width="${width}" height="${height}" fill="#ffffff"/><rect x="${margin - 24}" y="${margin - 24}" width="${width - (margin - 24) * 2}" height="${height - (margin - 24) * 2}" fill="none" stroke="#c8d3df" stroke-width="2"/><rect x="${margin - 24}" y="${margin - 24}" width="${width - (margin - 24) * 2}" height="16" fill="#1f5a91"/>`
-  ];
+  registerDocxPreviewFonts();
+  const canvas = createCanvas(width, height);
+  const context = canvas.getContext("2d");
+  context.fillStyle = "#ffffff";
+  context.fillRect(0, 0, width, height);
+  context.strokeStyle = "#c8d3df";
+  context.lineWidth = 2;
+  context.strokeRect(margin - 24, margin - 24, width - (margin - 24) * 2, height - (margin - 24) * 2);
+  context.fillStyle = "#1f5a91";
+  context.fillRect(margin - 24, margin - 24, width - (margin - 24) * 2, 16);
   let cursorY = margin + 36;
   for (const block of blocks) {
     if (block.kind === "paragraph") {
       const fontSize = block.heading === 1 ? 30 : block.heading === 2 ? 24 : block.heading === 3 ? 21 : 18;
       const x = block.align === "center" ? width / 2 : block.align === "right" ? width - margin : margin;
-      const rendered = docxPreviewTextSvg(block.text, x, cursorY, width - margin * 2, fontSize, block.align, block.heading ? "#0b2545" : "#1f2937", block.heading ? "700" : "400");
-      parts.push(rendered.svg);
-      cursorY += rendered.height + (block.heading ? 24 : 18);
+      const lines = docxPreviewTextLines(block.text, width - margin * 2, fontSize);
+      context.font = `${block.heading ? "700" : "400"} ${fontSize}px \"${containsArabic(block.text) ? "Tarjamah Arabic" : "Tarjamah Latin"}\"`;
+      context.textAlign = block.align === "center" ? "center" : block.align === "right" ? "right" : "left";
+      context.direction = containsArabic(block.text) ? "rtl" : "ltr";
+      context.fillStyle = block.heading ? "#0b2545" : "#1f2937";
+      lines.forEach((line, index) => context.fillText(line, x, cursorY + index * fontSize * 1.38));
+      const renderedHeight = lines.length * fontSize * 1.38;
+      cursorY += renderedHeight + (block.heading ? 24 : 18);
     } else {
       const columnCount = Math.max(1, ...block.rows.map((row) => row.length));
       const columnWidths = columnCount === 2 ? [width * 0.27 - margin, width * 0.73 - margin] : Array.from({ length: columnCount }, () => (width - margin * 2) / columnCount);
@@ -824,8 +837,16 @@ async function renderDocxPreviewPage(blocks: DocxPreviewBlock[], pageNumber: num
           const cellWidth = columnWidths[index] || columnWidths[columnWidths.length - 1];
           const cellText = row[index] || "";
           const arabic = containsArabic(cellText);
-          const rendered = docxPreviewTextSvg(cellText, arabic ? cellX + cellWidth - 16 : cellX + 16, cursorY + 28, cellWidth - 32, 17, arabic ? "right" : "left", "#1f2937");
-          parts.push(`<rect x="${cellX.toFixed(2)}" y="${cursorY.toFixed(2)}" width="${cellWidth.toFixed(2)}" height="${rowHeight.toFixed(2)}" fill="${rowIndex === 0 ? "#f4f6f9" : "#ffffff"}" stroke="#b8c5d2" stroke-width="2"/>`, rendered.svg);
+          context.fillStyle = rowIndex === 0 ? "#f4f6f9" : "#ffffff";
+          context.fillRect(cellX, cursorY, cellWidth, rowHeight);
+          context.strokeStyle = "#b8c5d2";
+          context.lineWidth = 2;
+          context.strokeRect(cellX, cursorY, cellWidth, rowHeight);
+          context.font = `400 17px \"${arabic ? "Tarjamah Arabic" : "Tarjamah Latin"}\"`;
+          context.textAlign = arabic ? "right" : "left";
+          context.direction = arabic ? "rtl" : "ltr";
+          context.fillStyle = "#1f2937";
+          docxPreviewTextLines(cellText, cellWidth - 32, 17).forEach((line, lineIndex) => context.fillText(line, arabic ? cellX + cellWidth - 16 : cellX + 16, cursorY + 28 + lineIndex * 24));
           cellX += cellWidth;
         }
         cursorY += rowHeight;
@@ -834,8 +855,12 @@ async function renderDocxPreviewPage(blocks: DocxPreviewBlock[], pageNumber: num
     }
     if (cursorY > height - margin - 80) break;
   }
-  parts.push(`<text x="${width - margin}" y="${height - margin + 12}" text-anchor="end" direction="ltr" font-family="'Tarjamah Noto Latin'" font-size="18px" fill="#5b6573">Preview page ${pageNumber} of ${totalPages}</text>`);
-  return sharp(Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">${parts.join("")}</svg>`)).png().toBuffer();
+  context.font = "400 18px \"Tarjamah Latin\"";
+  context.textAlign = "right";
+  context.direction = "ltr";
+  context.fillStyle = "#5b6573";
+  context.fillText(`Preview page ${pageNumber} of ${totalPages}`, width - margin, height - margin + 12);
+  return canvas.toBuffer("image/png");
 }
 
 export async function createDocxPreviewPdf(input: Buffer, maxPages = 2) {
