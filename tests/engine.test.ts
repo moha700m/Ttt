@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { PDFDocument } from "pdf-lib";
+import sharp from "sharp";
 import { analyzeDocument, buildValidationReport, translateDocument, translateTextMock } from "@/lib/document-engine";
 
 describe("document engine", () => {
@@ -21,5 +22,10 @@ describe("document engine", () => {
     const bytes = Buffer.from(await document.save());
     await expect(translateDocument(bytes, "scanned.pdf", "en", "ar", { protectVisualElements: true }))
       .rejects.toThrow("PDF_TEXT_LAYER_REQUIRED_FOR_PROTECTED_MODE");
+  });
+  it("does not rewrite standalone image files while visual protection is enabled", async () => {
+    const image = await sharp({ create: { width: 12, height: 12, channels: 3, background: "#ffffff" } }).png().toBuffer();
+    await expect(translateDocument(image, "protected.png", "en", "ar", { protectVisualElements: true }))
+      .rejects.toThrow("IMAGE_TRANSLATION_REQUIRES_UNPROTECTED_MODE");
   });
 });

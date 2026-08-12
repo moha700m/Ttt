@@ -45,8 +45,17 @@ function decodePdfStreams(bytes: Buffer) {
 async function buildFixture() {
   const document = await PDFDocument.create();
   const font = await document.embedFont(StandardFonts.Helvetica);
+  const logoCanvas = createCanvas(96, 48);
+  const logoContext = logoCanvas.getContext("2d");
+  logoContext.fillStyle = "#1f5a91";
+  logoContext.fillRect(0, 0, 96, 48);
+  logoContext.fillStyle = "#ffffff";
+  logoContext.font = "bold 22px Arial";
+  logoContext.fillText("GOV", 29, 31);
+  const logo = await document.embedPng(logoCanvas.toBuffer("image/png"));
   for (let pageIndex = 0; pageIndex < 2; pageIndex += 1) {
     const page = document.addPage([595, 842]);
+    page.drawImage(logo, { x: 54, y: 770, width: 96, height: 48 });
     page.drawText(pageIndex === 0 ? "Invoice" : "Invoice number", { x: 54, y: 750, size: 24, font });
     page.drawText(pageIndex === 0 ? "Date" : "Name", { x: 54, y: 710, size: 15, font });
     page.drawText(pageIndex === 0 ? "Total" : "Payment status", { x: 54, y: 670, size: 15, font });
@@ -56,6 +65,10 @@ async function buildFixture() {
     page.drawLine({ start: { x: 298, y: 470 }, end: { x: 298, y: 570 }, thickness: 1, color: rgb(0.2, 0.3, 0.4) });
   }
   return Buffer.from(await document.save());
+}
+
+function countPdfImages(bytes: Buffer) {
+  return (bytes.toString("latin1").match(/\/Subtype\s*\/Image\b/g) || []).length;
 }
 
 async function main() {
@@ -73,6 +86,7 @@ async function main() {
   const source = await buildFixture();
   const translated = await translateDocument(source, "pdf-regression.pdf", "en", "ar");
   assert.ok(translated.changedBlocks >= 6, "mock translation should replace the fixture's translatable blocks");
+  assert.equal(countPdfImages(translated.bytes), countPdfImages(source), "protected PDF translation must preserve embedded images");
 
   const preview = await addPdfWatermark(translated.bytes, "PREVIEW ONLY - NOT FOR DELIVERY - REGRESSION");
   await writeFile(path.join(workDirectory, "source.pdf"), source);

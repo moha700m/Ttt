@@ -371,7 +371,9 @@ export async function renderTranslatedImage(input: Buffer, filename: string, ite
 }
 
 function imagePrompt(source: "ar" | "en", target: "ar" | "en", protectVisualElements: boolean) {
-  const protectedInstruction = protectVisualElements ? "Protection mode is enabled: do not translate or cover text inside logos, seals, stamps, signatures, photographs, barcodes, QR codes, icons, or decorative artwork. Return only standalone document text regions that can be safely overlaid." : "When a text region is part of a logo, seal, stamp, signature, photograph, barcode, QR code, icon, or decorative artwork, preserve the visual element unless the user explicitly needs that text translated.";
+  const protectedInstruction = protectVisualElements
+    ? "Protection mode is enabled: do not rewrite, cover, crop, or rasterize the source image. Do not translate text inside logos, seals, stamps, signatures, photographs, barcodes, QR codes, icons, or decorative artwork. Return only standalone document text regions that can be safely overlaid."
+    : "Protection mode is disabled because the user explicitly requested translation of text inside the image. Detect and translate text wherever it appears, including inside logos, seals, stamps, signatures, photographs, labels, and other artwork when it is readable. Preserve every non-text visual element, its position, colors, and proportions; do not remove or redesign the image.";
   return `Translate every visible ${source === "ar" ? "Arabic" : "English"} text in this image into ${target === "ar" ? "Arabic" : "English"}. Return ONLY valid JSON in this exact shape: {"items":[{"source_text":"...","target_text":"...","box":{"x":0.0,"y":0.0,"width":0.0,"height":0.0},"background_color":"#ffffff","text_color":"#000000","align":"left","font_weight":"600"}]}. Coordinates must be normalized fractions of the full image from 0 to 1. Include only text that needs translation, including small footer text. Do not include icons, decorative marks, ratings stars, or text that is already in the target language. Preserve numbers, punctuation, brand names, and line breaks. Estimate the background and text colors from each text region. ${protectedInstruction} Do not add explanations or markdown.`;
 }
 
@@ -406,6 +408,7 @@ async function translateImageWithAnthropic(input: Buffer, filename: string, sour
 
 async function translateImage(input: Buffer, filename: string, source: "ar" | "en", target: "ar" | "en", options: DocumentTranslationOptions = {}) {
   if (source === target) return { bytes: input, changedBlocks: 0 };
+  // Protected image jobs fail closed before any image bytes are rewritten.
   if (options.protectVisualElements !== false) throw new Error("IMAGE_TRANSLATION_REQUIRES_UNPROTECTED_MODE");
   if (process.env.AI_PROVIDER === "anthropic" && process.env.ANTHROPIC_API_KEY) return translateImageWithAnthropic(input, filename, source, target, options);
   throw new Error("IMAGE_TRANSLATION_REQUIRES_ANTHROPIC");
@@ -574,6 +577,7 @@ function drawTranslatedPdfLine(page: Awaited<ReturnType<PDFDocument["getPages"]>
 }
 
 async function translatePdfVisually(input: Buffer, filename: string, source: "ar" | "en", target: "ar" | "en", options: DocumentTranslationOptions = {}) {
+  // Rasterizing a scanned PDF is an intentional opt-in because it rewrites the page image.
   if (options.protectVisualElements !== false) throw new Error("PDF_TEXT_LAYER_REQUIRED_FOR_PROTECTED_MODE");
   if (!process.env.ANTHROPIC_API_KEY) throw new Error("PDF_TRANSLATION_REQUIRES_ANTHROPIC");
   let canvasModule: typeof import("@napi-rs/canvas");
