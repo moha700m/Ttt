@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { canAccessOrder, jsonError, publicOrder } from "@/lib/api";
-import { addPdfWatermark, buildValidationReport, translateDocument } from "@/lib/document-engine";
+import { addPdfWatermark, buildValidationReport, createDocxPreviewPdf, translateDocument } from "@/lib/document-engine";
 import { addAudit, getOrder, readPrivateFile, savePrivateFile, updateOrder } from "@/lib/store";
 
 export const runtime = "nodejs";
@@ -20,8 +20,12 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     const translated = await translateDocument(input, original.filename, order.sourceLanguage, order.targetLanguage, { protectVisualElements: order.protectVisualElements !== false });
     const working = await savePrivateFile(id, "translated_working", original.filename, translated.bytes);
     const isPdf = original.mimeType === "application/pdf" || /\.pdf$/i.test(original.filename);
-    const previewBytes = isPdf ? await addPdfWatermark(translated.bytes, `PREVIEW ONLY - NOT FOR DELIVERY - ${order.orderNumber}`) : translated.bytes;
-    const preview = await savePrivateFile(id, "translated_preview", original.filename, previewBytes);
+    const isDocx = original.mimeType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || /\.docx$/i.test(original.filename);
+    const previewSource = isDocx ? await createDocxPreviewPdf(translated.bytes, 2) : translated.bytes;
+    const previewBytes = isPdf || isDocx ? await addPdfWatermark(previewSource, `PREVIEW ONLY - NOT FOR DELIVERY - ${order.orderNumber}`) : previewSource;
+    const previewFilename = isDocx ? original.filename.replace(/\.docx$/i, ".preview.pdf") : original.filename;
+    const previewMimeType = isDocx ? "application/pdf" : original.mimeType;
+    const preview = await savePrivateFile(id, "translated_preview", previewFilename, previewBytes, previewMimeType);
     const validation = buildValidationReport(translated.changedBlocks, order.pages);
     const updated = await updateOrder(id, (current) => ({
       ...current,
@@ -30,7 +34,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
       files: [
         ...current.files.filter((file) => file.version !== "translated_working" && file.version !== "translated_preview"),
         { version: "translated_working", storageKey: working.storageKey, filename: original.filename, mimeType: original.mimeType, size: working.size, sha256: working.sha256, createdAt: new Date().toISOString() },
-        { version: "translated_preview", storageKey: preview.storageKey, filename: original.filename, mimeType: original.mimeType, size: preview.size, sha256: preview.sha256, createdAt: new Date().toISOString() }
+        { version: "translated_preview", storageKey: preview.storageKey, filename: previewFilename, mimeType: previewMimeType, size: preview.size, sha256: preview.sha256, createdAt: new Date().toISOString() }
       ]
     }));
     await addAudit("preview_generated", "customer", id, { changedBlocks: translated.changedBlocks });

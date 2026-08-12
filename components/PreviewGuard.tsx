@@ -17,7 +17,7 @@ const watermarkLabels = [
   "غير صالح للتسليم"
 ];
 
-export default function PreviewGuard({ previewUrl, orderNumber }: { previewUrl: string; orderNumber: string }) {
+export default function PreviewGuard({ previewUrl, orderNumber, previewPages }: { previewUrl: string; orderNumber: string; previewPages?: number }) {
   const [blocked, setBlocked] = useState(false);
   const labels = useMemo(() => watermarkLabels.map((label, index) => `${label} · ${orderNumber} · ${index + 1}`), [orderNumber]);
 
@@ -68,7 +68,7 @@ export default function PreviewGuard({ previewUrl, orderNumber }: { previewUrl: 
         </div>
         <span className="preview-badge">محمية بعلامة مائية</span>
       </header>
-      <p className="preview-warning">هذه معاينة كاملة للمراجعة فقط. لا تصلح للتسليم أو الاستخدام التجاري، وتظهر العلامة المائية على كامل الصفحات.</p>
+      <p className="preview-warning">{previewPages ? `هذه معاينة صور لأول ${previewPages} صفحات مترجمة فقط للمراجعة. ` : "هذه معاينة كاملة للمراجعة فقط. "}لا تصلح للتسليم أو الاستخدام التجاري، وتظهر العلامة المائية المتكررة على كامل المعاينة.</p>
       <section className="preview-stage" aria-label="معاينة المستند">
         <iframe
           className="preview-frame"

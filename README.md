@@ -30,3 +30,5 @@ Set Supabase credentials for Postgres and private Storage, one AI provider key f
 ## Visual protection mode
 
 New orders enable visual protection by default. Text-based PDFs and DOCX files are translated in place while images, logos, seals, signatures, barcodes, QR codes, tables, and lines are kept as document elements. Protected standalone images are never rewritten: the job fails closed before any image bytes are changed. For scanned PDFs and raster images, uncheck the protection option only when translation of text inside the image is intentionally required; the non-text artwork is still preserved as part of the translated output.
+
+DOCX previews intentionally show the first two translated pages as image-based PDF pages with repeated preview watermarks. The complete translated DOCX remains stored separately and is only released through the existing payment/approval flow.

@@ -28,7 +28,11 @@ function escapeXml(value: string) {
 }
 
 function unescapeXml(value: string) {
-  return value.replace(/&apos;/g, "'").replace(/&quot;/g, '"').replace(/&gt;/g, ">").replace(/&lt;/g, "<").replace(/&amp;/g, "&");
+  return value
+    .replace(/&#x([0-9a-f]+);/gi, (_match, hex: string) => String.fromCodePoint(Number.parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_match, decimal: string) => String.fromCodePoint(Number.parseInt(decimal, 10)))
+    .replace(/&apos;/g, "'").replace(/&quot;/g, '"').replace(/&gt;/g, ">")
+    .replace(/&lt;/g, "<").replace(/&amp;/g, "&");
 }
 
 function escapeRegExp(value: string) {
@@ -103,6 +107,25 @@ async function translateTextBatch(texts: string[], source: "ar" | "en", target: 
   }
   if (process.env.AI_PROVIDER === "openai") throw new Error("TRANSLATION_REQUIRES_OPENAI");
   throw new Error("TRANSLATION_PROVIDER_NOT_CONFIGURED");
+}
+
+async function translateTextBatches(texts: string[], source: "ar" | "en", target: "ar" | "en") {
+  if (!texts.length || source === target) return texts;
+  const batches: string[][] = [];
+  let current: string[] = [];
+  let currentLength = 0;
+  for (const text of texts) {
+    if (current.length && (current.length >= 24 || currentLength + text.length > 7000)) {
+      batches.push(current);
+      current = [];
+      currentLength = 0;
+    }
+    current.push(text);
+    currentLength += text.length;
+  }
+  if (current.length) batches.push(current);
+  const translatedBatches = await Promise.all(batches.map((batch) => translateTextBatch(batch, source, target)));
+  return translatedBatches.flat();
 }
 
 type ImageTextAlignment = "left" | "center" | "right";
@@ -697,9 +720,14 @@ async function translateDocx(input: Buffer, source: "ar" | "en", target: "ar" | 
   let changedBlocks = 0;
   for (const entry of entries) {
     let xml = entry.getData().toString("utf8");
-    xml = xml.replace(/(<w:t(?:\s[^>]*)?>)([\s\S]*?)(<\/w:t>)/g, (_match, start: string, body: string, end: string) => {
-      const original = unescapeXml(body);
-      const translated = translateTextMock(original, source, target);
+    const textMatches = Array.from(xml.matchAll(/(<w:t(?:\s[^>]*)?>)([\s\S]*?)(<\/w:t>)/g));
+    const originals = textMatches.map((match) => unescapeXml(match[2]));
+    const translatedTexts = await translateTextBatches(originals, source, target);
+    let textIndex = 0;
+    xml = xml.replace(/(<w:t(?:\s[^>]*)?>)([\s\S]*?)(<\/w:t>)/g, (_match, start: string, _body: string, end: string) => {
+      const original = originals[textIndex] || "";
+      const translated = translatedTexts[textIndex] || original;
+      textIndex += 1;
       if (translated !== original) changedBlocks += 1;
       return `${start}${escapeXml(translated)}${end}`;
     });
@@ -708,10 +736,123 @@ async function translateDocx(input: Buffer, source: "ar" | "en", target: "ar" | 
   return { bytes: zip.toBuffer(), changedBlocks };
 }
 
+type DocxPreviewBlock =
+  | { kind: "paragraph"; text: string; align: "left" | "center" | "right"; heading: number }
+  | { kind: "table"; rows: string[][] };
+
+function docxTextFromXml(value: string) {
+  return Array.from(value.matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g))
+    .map((match) => unescapeXml(match[1]))
+    .join("")
+    .replace(/<w:tab\s*\/>/g, "\t")
+    .replace(/<w:br\s*\/>/g, "\n")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function docxPreviewBlocks(input: Buffer) {
+  const zip = new AdmZip(input);
+  const entry = zip.getEntry("word/document.xml");
+  if (!entry) throw new Error("DOCX_DOCUMENT_XML_MISSING");
+  const xml = entry.getData().toString("utf8");
+  const bodyStart = xml.indexOf(">", xml.indexOf("<w:body"));
+  const bodyEnd = xml.lastIndexOf("</w:body>");
+  const body = bodyStart >= 0 && bodyEnd > bodyStart ? xml.slice(bodyStart + 1, bodyEnd) : xml;
+  const blocks = Array.from(body.matchAll(/<w:p\b[\s\S]*?<\/w:p>|<w:tbl\b[\s\S]*?<\/w:tbl>/g)).map((match) => match[0]);
+  const pages: DocxPreviewBlock[][] = [[]];
+  for (const block of blocks) {
+    if (block.startsWith("<w:tbl")) {
+      const rows = Array.from(block.matchAll(/<w:tr\b[\s\S]*?<\/w:tr>/g)).map((rowMatch) =>
+        Array.from(rowMatch[0].matchAll(/<w:tc\b[\s\S]*?<\/w:tc>/g)).map((cellMatch) => docxTextFromXml(cellMatch[0]))
+      ).filter((row) => row.some(Boolean));
+      if (rows.length) pages.at(-1)?.push({ kind: "table", rows });
+    } else {
+      const text = docxTextFromXml(block);
+      const paragraphProperties = block.match(/<w:pPr\b[\s\S]*?<\/w:pPr>/)?.[0] || "";
+      const heading = paragraphProperties.match(/w:pStyle\s+w:val="Heading([123])"/)?.[1];
+      const alignValue = paragraphProperties.match(/w:jc\s+w:val="(left|center|right)"/)?.[1];
+      if (text) pages.at(-1)?.push({ kind: "paragraph", text, align: (alignValue || (containsArabic(text) ? "right" : "left")) as "left" | "center" | "right", heading: heading ? Number(heading) : 0 });
+    }
+    if (/<w:br\b[^>]*w:type="page"|<w:lastRenderedPageBreak\s*\/>/.test(block)) pages.push([]);
+  }
+  while (pages.length > 1 && pages.at(-1)?.length === 0) pages.pop();
+  return pages.length ? pages : [[]];
+}
+
+function countDocxPages(input: Buffer) {
+  return Math.max(1, docxPreviewBlocks(input).length);
+}
+
+function docxPreviewTextLines(text: string, width: number, fontSize: number) {
+  return wrapSvgText(text, Math.max(10, Math.floor(width / (fontSize * 0.52))));
+}
+
+function docxPreviewTextSvg(text: string, x: number, y: number, width: number, fontSize: number, align: "left" | "center" | "right", color: string, weight = "400") {
+  const lines = docxPreviewTextLines(text, width, fontSize);
+  const direction = containsArabic(text) ? "rtl" : "ltr";
+  const anchor = align === "center" ? "middle" : align === "right" ? "end" : "start";
+  const lineHeight = fontSize * 1.38;
+  const tspans = lines.map((line, index) => `<tspan x="${x.toFixed(2)}" y="${(y + index * lineHeight).toFixed(2)}">${escapeXml(line)}</tspan>`).join("");
+  return { svg: `<text x="${x.toFixed(2)}" y="${y.toFixed(2)}" text-anchor="${anchor}" direction="${direction}" unicode-bidi="plaintext" font-family="'Tarjamah Noto Arabic', 'Tarjamah Noto Latin'" font-size="${fontSize.toFixed(2)}px" font-weight="${weight}" fill="${color}">${tspans}</text>`, height: lines.length * lineHeight };
+}
+
+async function renderDocxPreviewPage(blocks: DocxPreviewBlock[], pageNumber: number, totalPages: number) {
+  const width = 1224;
+  const height = 1584;
+  const margin = 96;
+  const fonts = { arabic: await readBundledFont("arabic"), latin: await readBundledFont("latin") };
+  const parts = [
+    `<style>@font-face{font-family:'Tarjamah Noto Arabic';src:url(data:font/ttf;base64,${fonts.arabic.toString("base64")}) format('truetype');font-weight:400;}@font-face{font-family:'Tarjamah Noto Latin';src:url(data:font/ttf;base64,${fonts.latin.toString("base64")}) format('truetype');font-weight:400;}</style>`,
+    `<rect width="${width}" height="${height}" fill="#ffffff"/><rect x="${margin - 24}" y="${margin - 24}" width="${width - (margin - 24) * 2}" height="${height - (margin - 24) * 2}" fill="none" stroke="#c8d3df" stroke-width="2"/><rect x="${margin - 24}" y="${margin - 24}" width="${width - (margin - 24) * 2}" height="16" fill="#1f5a91"/>`
+  ];
+  let cursorY = margin + 36;
+  for (const block of blocks) {
+    if (block.kind === "paragraph") {
+      const fontSize = block.heading === 1 ? 30 : block.heading === 2 ? 24 : block.heading === 3 ? 21 : 18;
+      const x = block.align === "center" ? width / 2 : block.align === "right" ? width - margin : margin;
+      const rendered = docxPreviewTextSvg(block.text, x, cursorY, width - margin * 2, fontSize, block.align, block.heading ? "#0b2545" : "#1f2937", block.heading ? "700" : "400");
+      parts.push(rendered.svg);
+      cursorY += rendered.height + (block.heading ? 24 : 18);
+    } else {
+      const columnCount = Math.max(1, ...block.rows.map((row) => row.length));
+      const columnWidths = columnCount === 2 ? [width * 0.27 - margin, width * 0.73 - margin] : Array.from({ length: columnCount }, () => (width - margin * 2) / columnCount);
+      for (const [rowIndex, row] of block.rows.entries()) {
+        const cellLines = row.map((cell, index) => docxPreviewTextLines(cell, Math.max(80, columnWidths[index] || columnWidths[columnWidths.length - 1]) - 32, 17));
+        const rowHeight = Math.max(42, ...cellLines.map((lines) => lines.length * 24 + 24));
+        let cellX = margin;
+        for (let index = 0; index < columnCount; index += 1) {
+          const cellWidth = columnWidths[index] || columnWidths[columnWidths.length - 1];
+          const cellText = row[index] || "";
+          const arabic = containsArabic(cellText);
+          const rendered = docxPreviewTextSvg(cellText, arabic ? cellX + cellWidth - 16 : cellX + 16, cursorY + 28, cellWidth - 32, 17, arabic ? "right" : "left", "#1f2937");
+          parts.push(`<rect x="${cellX.toFixed(2)}" y="${cursorY.toFixed(2)}" width="${cellWidth.toFixed(2)}" height="${rowHeight.toFixed(2)}" fill="${rowIndex === 0 ? "#f4f6f9" : "#ffffff"}" stroke="#b8c5d2" stroke-width="2"/>`, rendered.svg);
+          cellX += cellWidth;
+        }
+        cursorY += rowHeight;
+      }
+      cursorY += 18;
+    }
+    if (cursorY > height - margin - 80) break;
+  }
+  parts.push(`<text x="${width - margin}" y="${height - margin + 12}" text-anchor="end" direction="ltr" font-family="'Tarjamah Noto Latin'" font-size="18px" fill="#5b6573">Preview page ${pageNumber} of ${totalPages}</text>`);
+  return sharp(Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">${parts.join("")}</svg>`)).png().toBuffer();
+}
+
+export async function createDocxPreviewPdf(input: Buffer, maxPages = 2) {
+  const pages = docxPreviewBlocks(input).slice(0, Math.max(1, Math.min(2, maxPages)));
+  const output = await PDFDocument.create();
+  for (let index = 0; index < pages.length; index += 1) {
+    const page = output.addPage([612, 792]);
+    const image = await output.embedPng(await renderDocxPreviewPage(pages[index], index + 1, pages.length));
+    page.drawImage(image, { x: 0, y: 0, width: page.getWidth(), height: page.getHeight() });
+  }
+  return Buffer.from(await output.save());
+}
+
 export async function analyzeDocument(input: Buffer, filename: string) {
   const extension = filename.toLowerCase().split(".").pop();
   if (extension === "pdf") return { pages: (await PDFDocument.load(input)).getPageCount(), kind: "pdf" as const };
-  if (extension === "docx") return { pages: 1, kind: "docx" as const };
+  if (extension === "docx") return { pages: countDocxPages(input), kind: "docx" as const };
   if (["jpg", "jpeg", "png", "webp"].includes(extension || "")) return { pages: 1, kind: "image" as const };
   throw new Error("UNSUPPORTED_DOCUMENT");
 }
