@@ -512,12 +512,12 @@ function fittedTextSize(text: string, fonts: EmbeddedPdfFonts, maximumWidth: num
 }
 
 function drawTranslatedPdfLine(page: Awaited<ReturnType<PDFDocument["getPages"]>>[number], line: PdfTextLine, translated: string, fonts: EmbeddedPdfFonts) {
-  const padding = 1.5;
+  const padding = Math.max(6, Math.min(10, line.height * 0.45));
   const width = Math.max(12, line.width + padding * 2);
   const height = Math.max(7, line.bottom - line.top + padding * 2);
   const x = Math.max(0, line.x - padding);
   const y = Math.max(0, page.getHeight() - line.bottom - padding);
-  page.drawRectangle({ x, y, width: Math.min(width, page.getWidth() - x), height: Math.min(height, page.getHeight() - y), color: rgb(1, 1, 1), opacity: 0.98 });
+  page.drawRectangle({ x, y, width: Math.min(width, page.getWidth() - x), height: Math.min(height, page.getHeight() - y), color: rgb(1, 1, 1), opacity: 1 });
   const requestedSize = Math.min(22, Math.max(7, (line.bottom - line.top) * 0.78));
   const size = fittedTextSize(translated, fonts, Math.max(12, line.width), requestedSize);
   const textWidth = measurePdfText(translated, fonts, size);
