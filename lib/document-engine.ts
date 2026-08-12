@@ -52,23 +52,37 @@ export function translateTextMock(text: string, source: "ar" | "en", target: "ar
   return reverse.find(([arabic]) => arabic === text.trim())?.[1] ?? replaceGlossaryTerms(text, reverse);
 }
 
-async function translateText(text: string, source: "ar" | "en", target: "ar" | "en") {
+function extractJsonArray(value: string, expectedLength: number) {
+  const withoutFence = value.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  const firstArray = withoutFence.indexOf("[");
+  const lastArray = withoutFence.lastIndexOf("]");
+  if (firstArray < 0 || lastArray <= firstArray) throw new Error("TRANSLATION_PROVIDER_INVALID_BATCH");
+  const parsed = JSON.parse(withoutFence.slice(firstArray, lastArray + 1)) as unknown;
+  if (!Array.isArray(parsed) || parsed.length !== expectedLength || parsed.some((entry) => typeof entry !== "string")) throw new Error("TRANSLATION_PROVIDER_INVALID_BATCH");
+  return parsed as string[];
+}
+
+async function translateTextBatch(texts: string[], source: "ar" | "en", target: "ar" | "en") {
+  if (!texts.length || source === target) return texts;
+  if (!process.env.AI_PROVIDER || process.env.AI_PROVIDER === "mock") return texts.map((text) => translateTextMock(text, source, target));
+
+  const payload = JSON.stringify(texts);
   if (process.env.AI_PROVIDER === "anthropic" && process.env.ANTHROPIC_API_KEY) {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "content-type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
       body: JSON.stringify({
         model: process.env.ANTHROPIC_TRANSLATION_MODEL || "claude-sonnet-4-5",
-        max_tokens: 512,
-        system: "You are a precise document translator. Return only the translation. Preserve names, numbers, dates, units, punctuation, and line breaks.",
-        messages: [{ role: "user", content: `Translate from ${source} to ${target}:\n${text}` }]
+        max_tokens: 4096,
+        system: "You are a precise document translator. Return ONLY a valid JSON array of translated strings in the same order as the input array. Preserve names, numbers, dates, units, punctuation, and line breaks.",
+        messages: [{ role: "user", content: `Translate each string in this JSON array from ${source} to ${target}. Keep the array length and order unchanged:\n${payload}` }]
       })
     });
     if (!response.ok) throw new Error(`TRANSLATION_PROVIDER_ANTHROPIC_${response.status}`);
     const body = await response.json() as { content?: Array<{ text?: string }> };
     const translated = body.content?.map((part) => part.text || "").join("").trim();
     if (!translated) throw new Error("TRANSLATION_PROVIDER_EMPTY_RESPONSE");
-    return translated;
+    return extractJsonArray(translated, texts.length);
   }
   if (process.env.AI_PROVIDER === "anthropic") throw new Error("TRANSLATION_REQUIRES_ANTHROPIC");
   if (process.env.AI_PROVIDER === "openai" && process.env.OPENAI_API_KEY) {
@@ -78,17 +92,16 @@ async function translateText(text: string, source: "ar" | "en", target: "ar" | "
       body: JSON.stringify({
         model: process.env.OPENAI_TRANSLATION_MODEL || "gpt-5-mini",
         temperature: 0,
-        messages: [{ role: "system", content: "Translate precisely. Return only translation. Preserve names, numbers, dates, units, punctuation, and line breaks." }, { role: "user", content: `Translate from ${source} to ${target}:\n${text}` }]
+        messages: [{ role: "system", content: "Translate precisely. Return ONLY a valid JSON array of translated strings in the same order as the input array. Preserve names, numbers, dates, units, punctuation, and line breaks." }, { role: "user", content: `Translate each string in this JSON array from ${source} to ${target}. Keep the array length and order unchanged:\n${payload}` }]
       })
     });
     if (!response.ok) throw new Error(`TRANSLATION_PROVIDER_OPENAI_${response.status}`);
     const body = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
     const translated = body.choices?.[0]?.message?.content?.trim();
     if (!translated) throw new Error("TRANSLATION_PROVIDER_EMPTY_RESPONSE");
-    return translated;
+    return extractJsonArray(translated, texts.length);
   }
   if (process.env.AI_PROVIDER === "openai") throw new Error("TRANSLATION_REQUIRES_OPENAI");
-  if (!process.env.AI_PROVIDER || process.env.AI_PROVIDER === "mock") return translateTextMock(text, source, target);
   throw new Error("TRANSLATION_PROVIDER_NOT_CONFIGURED");
 }
 
@@ -657,10 +670,13 @@ async function translatePdf(input: Buffer, source: "ar" | "en", target: "ar" | "
     return translatePdfVisually(input, filename, source, target, options);
   }
 
+  const lines = pages.flat();
+  const translatedLines = await translateTextBatch(lines.map((line) => line.text), source, target);
+  let translatedLineIndex = 0;
   for (let pageIndex = 0; pageIndex < pages.length; pageIndex += 1) {
     const page = document.getPages()[pageIndex];
     for (const line of pages[pageIndex]) {
-      const translated = await translateText(line.text, source, target);
+      const translated = translatedLines[translatedLineIndex++] || line.text;
       if (translated.trim() === line.text.trim()) continue;
       drawTranslatedPdfLine(page, line, translated, fonts);
       changedBlocks += 1;

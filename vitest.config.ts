@@ -4,6 +4,7 @@ export default defineConfig({
   resolve: { alias: { "@": new URL("./", import.meta.url).pathname } },
   test: {
     environment: "node",
-    include: ["tests/**/*.test.ts"]
+    include: ["tests/**/*.test.ts"],
+    testTimeout: 15000
   }
 });

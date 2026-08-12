@@ -9,6 +9,15 @@ const statusText: Record<string,string> = { quote_ready:"عرض السعر جا�
 const paymentLabels: Record<string,string> = { al_rajhi:"مصرف الراجحي", al_bilad:"بنك البلاد", arab_national:"البنك العربي الوطني", binance:"Binance" };
 const timeline = [["uploaded","رفع الملف"],["preview_ready","المعاينة"],["awaiting_payment_verification","الدفع"],["awaiting_certification","الاعتماد"],["completed","التسليم"]];
 
+async function readApiBody(response: Response) {
+  const raw = await response.text();
+  try {
+    return JSON.parse(raw) as { error?: string; order?: Order; message?: string };
+  } catch {
+    return { error: response.status >= 500 ? "تعذر تجهيز المعاينة الآن؛ اضغط إعادة المحاولة." : raw || "استجابة غير صالحة من الخادم" };
+  }
+}
+
 export default function OrderClient({ id, token }: { id:string; token:string }) {
   const [order, setOrder] = useState<Order|null>(null); const [busy, setBusy] = useState(""); const [error, setError] = useState(""); const [message, setMessage] = useState(""); const [method, setMethod] = useState("al_rajhi"); const [paymentDetails, setPaymentDetails] = useState<Record<string,string>|null>(null);
   const [receipt, setReceipt] = useState<File|null>(null);
@@ -17,7 +26,7 @@ export default function OrderClient({ id, token }: { id:string; token:string }) 
   const previewUrl = `/order/${id}/preview?token=${encodeURIComponent(token)}`;
   const finalUrl = `/api/orders/${id}/download?token=${encodeURIComponent(token)}`;
   const activeIndex = useMemo(() => { if (!order) return 0; if (["completed","certified"].includes(order.status)) return 4; if (["awaiting_certification","certified"].includes(order.status)) return 3; if (order.paymentStatus === "awaiting_payment_verification" || order.paymentStatus === "verified") return 2; if (order.status === "preview_ready") return 1; return 0; }, [order]);
-  async function translate() { setBusy("translate"); setError(""); try { const response = await fetch(`/api/orders/${id}/translate?token=${encodeURIComponent(token)}`, { method:"POST" }); const body=await response.json(); if (!response.ok) throw new Error(body.error); setOrder(body.order); setMessage("المعاينة جاهزة للمراجعة."); } catch(cause) { setError(cause instanceof Error ? cause.message : "تعذر تجهيز المعاينة"); } finally { setBusy(""); } }
+  async function translate() { setBusy("translate"); setError(""); try { const response = await fetch(`/api/orders/${id}/translate?token=${encodeURIComponent(token)}`, { method:"POST" }); const body=await readApiBody(response); if (!response.ok) throw new Error(body.error || "تعذر تجهيز المعاينة"); if (!body.order) throw new Error("تعذر تجهيز المعاينة"); setOrder(body.order); setMessage("المعاينة جاهزة للمراجعة."); } catch(cause) { setError(cause instanceof Error ? cause.message : "تعذر تجهيز المعاينة"); } finally { setBusy(""); } }
   async function pay(event: React.FormEvent<HTMLFormElement>) { event.preventDefault(); if (!receipt) { setError("اختر إيصال التحويل أولًا"); return; } setBusy("payment"); setError(""); const data=new FormData(event.currentTarget); data.set("token", token); data.set("method", method); data.set("receipt", receipt); try { const response=await fetch(`/api/orders/${id}/payment`, { method:"POST", body:data }); const body=await response.json(); if (!response.ok) throw new Error(body.error); setOrder(body.order); setMessage(body.message); } catch(cause) { setError(cause instanceof Error ? cause.message : "تعذر رفع الإيصال"); } finally { setBusy(""); } }
   if (!order && !error) return <div className="panel">جارٍ تحميل الطلب...</div>;
   if (error && !order) return <div className="error">{error}</div>;
