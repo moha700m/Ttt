@@ -105,6 +105,10 @@ export interface ImageTextItem {
   fontSize?: number;
 }
 
+export interface DocumentTranslationOptions {
+  protectVisualElements?: boolean;
+}
+
 const imageExtensions = new Set(["jpg", "jpeg", "png", "webp"]);
 const arabicCharacterPattern = /[\u0600-\u06ff\u0750-\u077f\ufb50-\ufdff\ufe70-\ufeff]/gu;
 const arabicCharacterTestPattern = /[\u0600-\u06ff\u0750-\u077f\ufb50-\ufdff\ufe70-\ufeff]/u;
@@ -319,8 +323,9 @@ export async function renderTranslatedImage(input: Buffer, filename: string, ite
   return rendered.jpeg({ quality: 95, chromaSubsampling: "4:4:4" }).toBuffer();
 }
 
-function imagePrompt(source: "ar" | "en", target: "ar" | "en") {
-  return `Translate every visible ${source === "ar" ? "Arabic" : "English"} text in this image into ${target === "ar" ? "Arabic" : "English"}. Return ONLY valid JSON in this exact shape: {"items":[{"source_text":"...","target_text":"...","box":{"x":0.0,"y":0.0,"width":0.0,"height":0.0},"background_color":"#ffffff","text_color":"#000000","align":"left","font_weight":"600"}]}. Coordinates must be normalized fractions of the full image from 0 to 1. Include only text that needs translation, including small footer text. Do not include icons, decorative marks, ratings stars, or text that is already in the target language. Preserve numbers, punctuation, brand names, and line breaks. Estimate the background and text colors from each text region. Do not add explanations or markdown.`;
+function imagePrompt(source: "ar" | "en", target: "ar" | "en", protectVisualElements: boolean) {
+  const protectedInstruction = protectVisualElements ? "Protection mode is enabled: do not translate or cover text inside logos, seals, stamps, signatures, photographs, barcodes, QR codes, icons, or decorative artwork. Return only standalone document text regions that can be safely overlaid." : "When a text region is part of a logo, seal, stamp, signature, photograph, barcode, QR code, icon, or decorative artwork, preserve the visual element unless the user explicitly needs that text translated.";
+  return `Translate every visible ${source === "ar" ? "Arabic" : "English"} text in this image into ${target === "ar" ? "Arabic" : "English"}. Return ONLY valid JSON in this exact shape: {"items":[{"source_text":"...","target_text":"...","box":{"x":0.0,"y":0.0,"width":0.0,"height":0.0},"background_color":"#ffffff","text_color":"#000000","align":"left","font_weight":"600"}]}. Coordinates must be normalized fractions of the full image from 0 to 1. Include only text that needs translation, including small footer text. Do not include icons, decorative marks, ratings stars, or text that is already in the target language. Preserve numbers, punctuation, brand names, and line breaks. Estimate the background and text colors from each text region. ${protectedInstruction} Do not add explanations or markdown.`;
 }
 
 async function prepareVisionImage(input: Buffer, filename: string) {
@@ -331,7 +336,7 @@ async function prepareVisionImage(input: Buffer, filename: string) {
   return { data: resized.toString("base64"), mediaType: "image/jpeg" };
 }
 
-async function translateImageWithAnthropic(input: Buffer, filename: string, source: "ar" | "en", target: "ar" | "en") {
+async function translateImageWithAnthropic(input: Buffer, filename: string, source: "ar" | "en", target: "ar" | "en", options: DocumentTranslationOptions = {}) {
   const visionImage = await prepareVisionImage(input, filename);
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -340,7 +345,7 @@ async function translateImageWithAnthropic(input: Buffer, filename: string, sour
       model: process.env.ANTHROPIC_TRANSLATION_MODEL || "claude-sonnet-4-5",
       max_tokens: 2048,
       system: "You are a precise image document translator. Never hallucinate text. Return only the requested JSON.",
-      messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: visionImage.mediaType, data: visionImage.data } }, { type: "text", text: imagePrompt(source, target) }] }]
+      messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: visionImage.mediaType, data: visionImage.data } }, { type: "text", text: imagePrompt(source, target, options.protectVisualElements !== false) }] }]
     })
   });
   if (!response.ok) throw new Error(`IMAGE_TRANSLATION_PROVIDER_${response.status}`);
@@ -352,9 +357,10 @@ async function translateImageWithAnthropic(input: Buffer, filename: string, sour
   return { bytes: await renderTranslatedImage(input, filename, items), changedBlocks: items.length };
 }
 
-async function translateImage(input: Buffer, filename: string, source: "ar" | "en", target: "ar" | "en") {
+async function translateImage(input: Buffer, filename: string, source: "ar" | "en", target: "ar" | "en", options: DocumentTranslationOptions = {}) {
   if (source === target) return { bytes: input, changedBlocks: 0 };
-  if (process.env.AI_PROVIDER === "anthropic" && process.env.ANTHROPIC_API_KEY) return translateImageWithAnthropic(input, filename, source, target);
+  if (options.protectVisualElements !== false) throw new Error("IMAGE_TRANSLATION_REQUIRES_UNPROTECTED_MODE");
+  if (process.env.AI_PROVIDER === "anthropic" && process.env.ANTHROPIC_API_KEY) return translateImageWithAnthropic(input, filename, source, target, options);
   throw new Error("IMAGE_TRANSLATION_REQUIRES_ANTHROPIC");
 }
 
@@ -520,7 +526,8 @@ function drawTranslatedPdfLine(page: Awaited<ReturnType<PDFDocument["getPages"]>
   drawPdfText(page, translated, fonts, { x: textX, y: textY, size, color: rgb(0.05, 0.12, 0.2) });
 }
 
-async function translatePdfVisually(input: Buffer, filename: string, source: "ar" | "en", target: "ar" | "en") {
+async function translatePdfVisually(input: Buffer, filename: string, source: "ar" | "en", target: "ar" | "en", options: DocumentTranslationOptions = {}) {
+  if (options.protectVisualElements !== false) throw new Error("PDF_TEXT_LAYER_REQUIRED_FOR_PROTECTED_MODE");
   if (!process.env.ANTHROPIC_API_KEY) throw new Error("PDF_TRANSLATION_REQUIRES_ANTHROPIC");
   let canvasModule: typeof import("@napi-rs/canvas");
   try {
@@ -543,7 +550,7 @@ async function translatePdfVisually(input: Buffer, filename: string, source: "ar
     const context = canvas.getContext("2d");
     await sourcePage.render({ canvasContext: context, viewport, canvas } as never).promise;
     const pagePng = canvas.toBuffer("image/png");
-    const translated = await translateImageWithAnthropic(pagePng, `${filename}.png`, source, target);
+    const translated = await translateImageWithAnthropic(pagePng, `${filename}.png`, source, target, options);
     if (translated.changedBlocks <= 0) throw new Error("PDF_TRANSLATION_NO_TEXT");
     changedBlocks += translated.changedBlocks;
     const image = await output.embedPng(translated.bytes);
@@ -590,7 +597,7 @@ async function translateKnownFreelanceLetter(input: Buffer) {
   return { bytes: Buffer.from(await document.save()), changedBlocks: 8 };
 }
 
-async function translatePdf(input: Buffer, source: "ar" | "en", target: "ar" | "en", filename: string) {
+async function translatePdf(input: Buffer, source: "ar" | "en", target: "ar" | "en", filename: string, options: DocumentTranslationOptions = {}) {
   if (source === target) return { bytes: input, changedBlocks: 0 };
   const document = await PDFDocument.load(input);
   const fonts = await loadPdfFonts(document);
@@ -613,7 +620,7 @@ async function translatePdf(input: Buffer, source: "ar" | "en", target: "ar" | "
   }
 
   if (!pages.flat().length || !pages.every((lines) => isReadablePdfText(lines, source))) {
-    return translatePdfVisually(input, filename, source, target);
+    return translatePdfVisually(input, filename, source, target, options);
   }
 
   for (let pageIndex = 0; pageIndex < pages.length; pageIndex += 1) {
@@ -655,16 +662,16 @@ export async function analyzeDocument(input: Buffer, filename: string) {
   throw new Error("UNSUPPORTED_DOCUMENT");
 }
 
-export async function translateDocument(input: Buffer, filename: string, source: "ar" | "en", target: "ar" | "en") {
+export async function translateDocument(input: Buffer, filename: string, source: "ar" | "en", target: "ar" | "en", options: DocumentTranslationOptions = {}) {
   const extension = filename.toLowerCase().split(".").pop();
-  if (extension === "pdf") return translatePdf(input, source, target, filename);
+  if (extension === "pdf") return translatePdf(input, source, target, filename, options);
   if (extension === "docx") {
     if (source === target) return { bytes: input, changedBlocks: 0 };
     const translated = await translateDocx(input, source, target);
     if (translated.changedBlocks === 0) throw new Error("DOCX_TRANSLATION_NO_CHANGES");
     return translated;
   }
-  if (imageExtensions.has(extension || "")) return translateImage(input, filename, source, target);
+  if (imageExtensions.has(extension || "")) return translateImage(input, filename, source, target, options);
   throw new Error("UNSUPPORTED_DOCUMENT");
 }
 

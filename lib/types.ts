@@ -52,6 +52,7 @@ export interface Order {
   service: ServiceKind;
   documentType: DocumentType;
   urgent: boolean;
+  protectVisualElements: boolean;
   pages: number;
   amount: number;
   translationAmount: number;

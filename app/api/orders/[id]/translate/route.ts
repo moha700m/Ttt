@@ -17,7 +17,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
   try {
     await updateOrder(id, (current) => ({ ...current, status: "translating" }));
     const input = await readPrivateFile(id, original.storageKey);
-    const translated = await translateDocument(input, original.filename, order.sourceLanguage, order.targetLanguage);
+    const translated = await translateDocument(input, original.filename, order.sourceLanguage, order.targetLanguage, { protectVisualElements: order.protectVisualElements !== false });
     const working = await savePrivateFile(id, "translated_working", original.filename, translated.bytes);
     const isPdf = original.mimeType === "application/pdf" || /\.pdf$/i.test(original.filename);
     const previewBytes = isPdf ? await addPdfWatermark(translated.bytes, `PREVIEW ONLY - NOT FOR DELIVERY - ${order.orderNumber}`) : translated.bytes;
@@ -37,6 +37,11 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     return NextResponse.json({ order: publicOrder(updated) });
   } catch (error) {
     await updateOrder(id, (current) => ({ ...current, status: "failed", failureReason: error instanceof Error ? error.message : "translation_failed" }));
-    return jsonError("تعذر تجهيز المعاينة", 500);
+    const message = error instanceof Error && error.message === "PDF_TEXT_LAYER_REQUIRED_FOR_PROTECTED_MODE"
+      ? "وضع حماية العناصر المرئية يتطلب ملف PDF نصيًا؛ ألغِ الحماية فقط إذا أردت ترجمة ملف ممسوح ضوئيًا."
+      : error instanceof Error && error.message === "IMAGE_TRANSLATION_REQUIRES_UNPROTECTED_MODE"
+        ? "وضع حماية العناصر المرئية لا يغير ملفات الصور؛ ألغِ الحماية فقط للسماح بترجمة النص داخل الصورة."
+        : "تعذر تجهيز المعاينة";
+    return jsonError(message, 500);
   }
 }

@@ -16,7 +16,9 @@ const requestSchema = z.object({
   targetLanguage: z.enum(["ar", "en"]),
   service: z.enum(["translation", "certified"]),
   documentType: z.enum(["general", "medical", "legal", "academic"]),
-  urgent: z.enum(["true", "false"]).default("false")
+  urgent: z.enum(["true", "false"]).default("false"),
+  protectVisualElements: z.enum(["true", "false"]).optional(),
+  protectVisualElementsConfigured: z.enum(["true"]).optional()
 });
 
 export async function POST(request: Request) {
@@ -26,7 +28,7 @@ export async function POST(request: Request) {
     if (!(file instanceof File)) return NextResponse.json({ error: "يجب رفع ملف" }, { status: 400 });
     if (file.size > 25 * 1024 * 1024) return NextResponse.json({ error: "الحد الأقصى للملف 25MB" }, { status: 413 });
     const input = requestSchema.parse({
-      customerName: form.get("customerName"), customerEmail: form.get("customerEmail"), sourceLanguage: form.get("sourceLanguage"), targetLanguage: form.get("targetLanguage"), service: form.get("service"), documentType: form.get("documentType"), urgent: form.get("urgent") || "false"
+      customerName: form.get("customerName"), customerEmail: form.get("customerEmail"), sourceLanguage: form.get("sourceLanguage"), targetLanguage: form.get("targetLanguage"), service: form.get("service"), documentType: form.get("documentType"), urgent: form.get("urgent") || "false", protectVisualElements: form.get("protectVisualElements") || undefined, protectVisualElementsConfigured: form.get("protectVisualElementsConfigured") || undefined
     });
     if (input.sourceLanguage === input.targetLanguage) return NextResponse.json({ error: "اختر لغتين مختلفتين" }, { status: 400 });
     const bytes = Buffer.from(await file.arrayBuffer());
@@ -39,7 +41,7 @@ export async function POST(request: Request) {
     const order = await createOrder({
       id, orderNumber: `TR-${new Date().getFullYear()}-${id.slice(0, 8).toUpperCase()}`, customerName: input.customerName, customerEmail: input.customerEmail,
       sourceLanguage: input.sourceLanguage, targetLanguage: input.targetLanguage, service: input.service, documentType: input.documentType,
-      urgent: input.urgent === "true", pages: quote.pages, amount: quote.amount, translationAmount: quote.translationAmount, certificationAmount: quote.certificationAmount, vatAmount: quote.vatAmount,
+      urgent: input.urgent === "true", protectVisualElements: input.protectVisualElements === undefined ? input.protectVisualElementsConfigured !== "true" : input.protectVisualElements === "true", pages: quote.pages, amount: quote.amount, translationAmount: quote.translationAmount, certificationAmount: quote.certificationAmount, vatAmount: quote.vatAmount,
       status: "quote_ready", paymentStatus: "unpaid", files: [{ version: "original", storageKey: stored.storageKey, filename: file.name, mimeType: file.type || "application/octet-stream", size: stored.size, sha256: stored.sha256, createdAt: now }], createdAt: now, updatedAt: now, customerTokenHash: hashToken(customerToken)
     });
     await addAudit("order_created", "customer", id, { filename: file.name, pages: quote.pages });

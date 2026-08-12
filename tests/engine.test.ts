@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { PDFDocument } from "pdf-lib";
-import { analyzeDocument, buildValidationReport, translateTextMock } from "@/lib/document-engine";
+import { analyzeDocument, buildValidationReport, translateDocument, translateTextMock } from "@/lib/document-engine";
 
 describe("document engine", () => {
   it("keeps PDF page count stable", async () => {
@@ -15,5 +15,11 @@ describe("document engine", () => {
   });
   it("returns an explicit safety report", () => {
     expect(buildValidationReport(4, 1).formatting).toBe("PASS");
+  });
+  it("fails closed instead of rasterizing a scanned PDF in visual-protection mode", async () => {
+    const document = await PDFDocument.create(); document.addPage();
+    const bytes = Buffer.from(await document.save());
+    await expect(translateDocument(bytes, "scanned.pdf", "en", "ar", { protectVisualElements: true }))
+      .rejects.toThrow("PDF_TEXT_LAYER_REQUIRED_FOR_PROTECTED_MODE");
   });
 });

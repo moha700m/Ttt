@@ -26,3 +26,7 @@ npm run build
 ## Production adapters
 
 Set Supabase credentials for Postgres and private Storage, one AI provider key for real translation, and a private certification stamp. Never commit `.env.local` or service keys.
+
+## Visual protection mode
+
+New orders enable visual protection by default. Text-based PDFs and DOCX files are translated in place while images, logos, seals, signatures, barcodes, QR codes, tables, and lines are kept as document elements. For scanned PDFs and raster images, protected mode fails closed instead of rewriting the image; uncheck the protection option only when image text translation is intentionally required.
