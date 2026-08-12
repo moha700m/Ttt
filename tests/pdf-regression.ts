@@ -94,6 +94,10 @@ async function main() {
     const text = content.items.map((item) => "str" in item && typeof item.str === "string" ? item.str : "").join(" ");
     assert.match(text, /[\u0600-\u06ff]/, `page ${pageIndex} must contain Arabic glyphs`);
     assert.doesNotMatch(text, /[\u25a1\ufffd]/, `page ${pageIndex} must not contain replacement or square glyphs`);
+    if (pageIndex === 1) {
+      assert.match(text, /فاتورة/, "Arabic text must remain in logical reading order");
+      assert.doesNotMatch(text, /ةروتاف/, "Arabic text must not be reversed before font shaping");
+    }
     assert.match(text, /PREVIEW|DELIVERY/, `page ${pageIndex} must contain the PDF watermark`);
 
     const viewport = page.getViewport({ scale: 1.5 });

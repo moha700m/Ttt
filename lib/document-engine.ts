@@ -113,6 +113,7 @@ const imageExtensions = new Set(["jpg", "jpeg", "png", "webp"]);
 const arabicCharacterPattern = /[\u0600-\u06ff\u0750-\u077f\ufb50-\ufdff\ufe70-\ufeff]/gu;
 const arabicCharacterTestPattern = /[\u0600-\u06ff\u0750-\u077f\ufb50-\ufdff\ufe70-\ufeff]/u;
 const bidi = bidiFactory();
+const bidiReorderSegments = (bidi as unknown as { getReorderSegments: (value: string, levels: ReturnType<typeof bidi.getEmbeddingLevels>) => Array<[number, number]> }).getReorderSegments;
 
 type EmbeddedPdfFont = Awaited<ReturnType<PDFDocument["embedFont"]>>;
 interface EmbeddedPdfFonts {
@@ -164,27 +165,60 @@ function containsArabic(value: string) {
   return arabicCharacterTestPattern.test(value);
 }
 
-function reorderForPdf(value: string) {
+function getPdfBidiSegments(value: string) {
   const normalized = value.replace(/\r?\n/g, " ").replace(/\s+/g, " ").trim();
-  if (!normalized || !containsArabic(normalized)) return normalized;
-  return bidi.getReorderedString(normalized, bidi.getEmbeddingLevels(normalized));
+  if (!normalized || !containsArabic(normalized)) return [normalized];
+
+  // pdf-lib/fontkit performs Arabic shaping from the logical character order.
+  // bidi-js is still used to order mixed RTL/LTR blocks, but each RTL block is
+  // handed back to fontkit in logical order so joining forms stay connected.
+  const levels = bidi.getEmbeddingLevels(normalized);
+  const reorderedIndices = Array.from({ length: normalized.length }, (_, index) => index);
+  for (const [start, end] of bidiReorderSegments(normalized, levels)) {
+    const segment = reorderedIndices.slice(start, end + 1).reverse();
+    reorderedIndices.splice(start, segment.length, ...segment);
+  }
+  const segments: string[] = [];
+  let group: number[] = [];
+  const flush = () => {
+    if (!group.length) return;
+    const start = Math.min(...group);
+    const end = Math.max(...group);
+    segments.push(normalized.slice(start, end + 1));
+    group = [];
+  };
+
+  reorderedIndices.forEach((index: number, position: number) => {
+    const previous = reorderedIndices[position - 1];
+    if (group.length && Math.abs(index - previous) !== 1) flush();
+    group.push(index);
+  });
+  flush();
+  return segments;
 }
 
 function splitPdfTextRuns(value: string, fonts: EmbeddedPdfFonts) {
-  const visual = reorderForPdf(value);
+  const logicalSegments = getPdfBidiSegments(value);
   const runs: Array<{ text: string; font: EmbeddedPdfFont }> = [];
   let current = "";
   let currentIsArabic: boolean | undefined;
-  for (const character of visual) {
-    const isArabic = arabicCharacterTestPattern.test(character);
-    if (current && currentIsArabic !== isArabic) {
-      runs.push({ text: current, font: currentIsArabic ? fonts.arabic : fonts.latin });
-      current = "";
+  const flush = () => {
+    if (!current) return;
+    runs.push({ text: current, font: currentIsArabic ? fonts.arabic : fonts.latin });
+    current = "";
+  };
+
+  for (const segment of logicalSegments) {
+    for (const character of segment) {
+      const isWhitespace = /\s/u.test(character);
+      const isArabic = arabicCharacterTestPattern.test(character);
+      const runIsArabic = isWhitespace && current ? currentIsArabic : isArabic;
+      if (current && currentIsArabic !== runIsArabic && !isWhitespace) flush();
+      currentIsArabic = runIsArabic;
+      current += character;
     }
-    currentIsArabic = isArabic;
-    current += character;
+    flush();
   }
-  if (current) runs.push({ text: current, font: currentIsArabic ? fonts.arabic : fonts.latin });
   return runs;
 }
 
